@@ -253,6 +253,9 @@ func (a *App) bootstrap() {
 	cancel()
 	if err != nil {
 		a.logf("WebDAV 连接失败：%v", err)
+		if webdav.IsAuthError(err) {
+			a.logf("提示：123 云盘 WebDAV 请使用官方文档中的 WebDAV 用户名/密码；账号未开通或无权限时也会返回 401。")
+		}
 		a.setInfo("WebDAV 连接失败（仍可浏览本地缓存）")
 		return
 	}

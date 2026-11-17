@@ -432,6 +432,7 @@ func (c *Client) roundTrip(ctx context.Context, method, target string, body []by
 		}
 		req.Header.Set("Content-Type", `application/xml; charset="utf-8"`)
 		req.Header.Set("Accept", "application/xml, text/xml, */*")
+		req.Header.Set("User-Agent", "pan123-client/1.0 (WebDAV)")
 		if username != "" || password != "" {
 			req.SetBasicAuth(username, password)
 		}

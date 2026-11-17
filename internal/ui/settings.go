@@ -132,8 +132,20 @@ func (a *App) onSettings() {
 				Title:  "WebDAV",
 				Layout: VBox{Spacing: 4},
 				Children: []Widget{
-					Label{Text: "WebDAV 根地址（例如 https://dav.example.com/dav/123pan）："},
-					LineEdit{AssignTo: &urlEdit, Text: old.WebDAVURL},
+					Label{Text: "WebDAV 根地址："},
+					Composite{
+						Layout: HBox{Spacing: 6},
+						Children: []Widget{
+							LineEdit{AssignTo: &urlEdit, Text: old.WebDAVURL, StretchFactor: 1},
+							PushButton{
+								Text:    "填入 123 云盘地址",
+								MinSize: Size{130, 0},
+								OnClicked: func() {
+									urlEdit.SetText(config.DefaultWebDAVURL)
+								},
+							},
+						},
+					},
 					Composite{
 						Layout: HBox{Spacing: 6},
 						Children: []Widget{
@@ -152,6 +164,7 @@ func (a *App) onSettings() {
 						AssignTo: &statusLabel,
 						Text:     describeWebDAV(&old),
 					},
+					Label{Text: "123 云盘官方 WebDAV：https://webdav.123pan.cn/webdav （用户名/密码见官方 WebDAV 文档）"},
 				},
 			},
 			GroupBox{
@@ -172,7 +185,7 @@ func (a *App) onSettings() {
 					HSpacer{},
 				},
 			},
-			Label{Text: "说明：123 云盘暂未提供官方 WebDAV 入口，可通过 WebDAV 网关（如 Alist 等）挂载 123 云盘后再填写其地址。"},
+			Label{Text: "说明：默认使用 123 云盘官方 WebDAV；也可以填写任意其它 WebDAV 地址（NAS、Alist 等）。"},
 			VSpacer{},
 			Composite{
 				Layout: HBox{Spacing: 8},
@@ -205,6 +218,9 @@ func describeWebDAV(c *config.Config) string {
 	auth := "匿名"
 	if c.Username != "" {
 		auth = "Basic Auth：" + c.Username
+	}
+	if strings.EqualFold(strings.TrimRight(c.WebDAVURL, "/"), config.DefaultWebDAVURL) {
+		return fmt.Sprintf("当前：123 云盘官方 WebDAV（%s）", auth)
 	}
 	return fmt.Sprintf("当前：%s（%s）", c.WebDAVURL, auth)
 }

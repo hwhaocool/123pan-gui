@@ -2,7 +2,9 @@
 
 基于 **Go + [walk](https://github.com/lxn/walk)** 的 Windows 桌面客户端：用树形控件浏览 WebDAV 上的目录，目录树缓存到本地 SQLite，按需同步。
 
-123 云盘官方 OpenAPI 需要购买「开发者权益包」，所以本项目改为走标准 **WebDAV** 协议：任何支持 WebDAV 的服务都能用（123 云盘可以先通过 Alist 等 WebDAV 网关挂载，再填其 WebDAV 地址）。
+123 云盘官方 OpenAPI 需要购买「开发者权益包」，所以本项目改为走标准 **WebDAV** 协议。
+
+**123 云盘官方 WebDAV 地址：`https://webdav.123pan.cn/webdav`**（Basic Auth），程序默认就填这个地址；也可以填任意其它 WebDAV 服务（NAS、Alist、自建等）。
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
@@ -54,10 +56,8 @@ go build -trimpath -ldflags "-H windowsgui" -o 123pan-client.exe .
 
 ## 使用
 
-1. 准备一个 WebDAV 地址，例如：
-   - 自建：`https://dav.example.com/dav/`（Apache/nginx-dav/NAS 等）
-   - 123 云盘：先用 [Alist](https://alist.nn.ci/) 等网关挂载 123 云盘，再使用其 WebDAV 服务地址
-2. 启动程序 → 「设置…」→ 填 **WebDAV 根地址、用户名、密码** → 「测试连接」→ 保存。
+1. 打开程序 → 「设置…」：WebDAV 地址默认是 `https://webdav.123pan.cn/webdav`（可点「填入 123 云盘地址」恢复）。
+2. 填 **用户名 / 密码**（123 云盘账号的 WebDAV 凭证，具体见官方文档；凭证不正确时接口会返回 401）→「测试连接」→ 保存。
 3. 首次启动会自动同步根目录第一层；之后在树上选中任意目录，点「同步选中目录」即可。
 
 ### 操作提示
@@ -128,6 +128,7 @@ CREATE TABLE entry (           -- 目录下的直接子项
 | 路径处理 | 逐段 URL 转义；响应 `href` 解码后去掉 WebDAV 根路径前缀；统一的绝对路径（`/电影/2024`）作为缓存与节点标识 |
 | 重定向 | 自行跟随 301/302/307/308（Go 默认会把 PROPFIND 重定向改成 GET） |
 | 限速 | 全局单飞队列，两次请求至少间隔 `1/QPS`；429 支持 `Retry-After` |
+| 请求头 | `User-Agent: pan123-client/1.0 (WebDAV)`，Basic Auth 预发送（不等 401 挑战） |
 | 错误 | 401/403 → 鉴权错误；404 → 路径不存在；405/501 → 提示「可能不是 WebDAV 服务」 |
 
 ## 代码结构
@@ -163,7 +164,7 @@ internal/
 - 只读浏览，不含上传 / 下载 / 删除 / 重命名（本项目的目标是「目录树浏览 + 可控同步」）。
 - 文件大小、修改时间等元数据来自 PROPFIND，取决于服务端是否提供。
 - 大目录树递归同步耗时受 QPS 限制（默认 5 QPS），建议先同步一层再逐级展开。
-- 123 云盘没有官方 WebDAV 入口，需要自建 WebDAV 网关（Alist 等）中转。
+- 123 云盘官方 WebDAV（`https://webdav.123pan.cn/webdav`）可能需要对应会员/权限，且凭证以官方 WebDAV 文档为准；连接失败时先检查 401 提示里的账号密码。
 
 ## 安全提示
 

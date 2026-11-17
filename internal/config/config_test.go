@@ -43,7 +43,7 @@ func TestLoadDefaultsAndRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.QPS != DefaultQPS || cfg.WebDAVURL != "" {
+	if cfg.QPS != DefaultQPS || cfg.WebDAVURL != DefaultWebDAVURL {
 		t.Fatalf("defaults = %+v", cfg)
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
@@ -98,5 +98,13 @@ func TestSanitize(t *testing.T) {
 	c.Sanitize()
 	if c.QPS != DefaultQPS {
 		t.Fatalf("qps = %v", c.QPS)
+	}
+}
+
+// TestDefaultWebDAVURL 验证默认配置指向 123 云盘官方 WebDAV。
+func TestDefaultWebDAVURL(t *testing.T) {
+	c := Default()
+	if c.WebDAVURL != "https://webdav.123pan.cn/webdav" {
+		t.Fatalf("default webdav url = %q", c.WebDAVURL)
 	}
 }

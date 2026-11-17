@@ -18,6 +18,9 @@ const (
 	// DefaultQPS 是默认限速（每秒请求数）。WebDAV 一般比开放平台宽松，保守取 5。
 	DefaultQPS = 5.0
 
+	// DefaultWebDAVURL 是 123 云盘官方 WebDAV 地址。
+	DefaultWebDAVURL = "https://webdav.123pan.cn/webdav"
+
 	// ConfigFileName / CacheFileName 是固定文件名。
 	ConfigFileName = "config.json"
 	CacheFileName  = "tree.db"
@@ -38,9 +41,9 @@ type Config struct {
 	LastSyncAt time.Time `json:"lastSyncAt,omitzero"`
 }
 
-// Default 返回一份默认配置。
+// Default 返回一份默认配置（默认指向 123 云盘官方 WebDAV）。
 func Default() *Config {
-	return &Config{QPS: DefaultQPS}
+	return &Config{QPS: DefaultQPS, WebDAVURL: DefaultWebDAVURL}
 }
 
 // Sanitize 修正越界/空值。
