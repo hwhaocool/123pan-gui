@@ -20,6 +20,8 @@ type Node struct {
 	loadFailed bool
 
 	children []*Node
+	dirs     []*Node // 已加载目录下的子文件夹
+	files    []*Node // 已加载目录下的文件
 }
 
 // emptyChildren 用于「尚未加载的文件夹」：非 nil 的空切片让 Outline
@@ -65,10 +67,9 @@ func (n *Node) DisplayPath() string {
 	return n.parent.DisplayPath() + "/" + n.entry.Name
 }
 
-// outlineChildren 供 ui.Outline 使用：
-//   - 文件返回 nil（叶子，无展开箭头）
-//   - 未加载的文件夹返回非 nil 空切片（显示箭头，展开后触发加载）
-//   - 已加载的空文件夹返回 nil（不再显示箭头）
+// outlineChildren 供 ui.Outline 使用（目录树只显示文件夹）：
+//   - 未加载的文件夹返回非 nil 空切片（显示展开箭头，展开后触发加载）
+//   - 已加载但没有子文件夹的目录返回 nil（不再显示箭头）
 func (n *Node) outlineChildren() []*Node {
 	if !n.IsDir() {
 		return nil
@@ -76,11 +77,14 @@ func (n *Node) outlineChildren() []*Node {
 	if !n.loaded {
 		return emptyChildren
 	}
-	if len(n.children) == 0 {
+	if len(n.dirs) == 0 {
 		return nil
 	}
-	return n.children
+	return n.dirs
 }
+
+// Files 返回已加载目录下的文件节点（目录树右侧的文件列表）。
+func (n *Node) Files() []*Node { return n.files }
 
 // mergeChildren 用最新列表更新子节点，按名称复用已有指针。
 func (n *Node) mergeChildren(entries []store.Entry) {
@@ -99,6 +103,8 @@ func (n *Node) mergeChildren(entries []store.Entry) {
 			if c.entry.IsDir != e.IsDir {
 				// 类型变化：丢弃旧的子树
 				c.children = nil
+				c.dirs = nil
+				c.files = nil
 				c.loaded = false
 			}
 			c.entry = e
@@ -112,6 +118,16 @@ func (n *Node) mergeChildren(entries []store.Entry) {
 		})
 	}
 	n.children = next
+
+	n.dirs = n.dirs[:0]
+	n.files = n.files[:0]
+	for _, c := range next {
+		if c.IsDir() {
+			n.dirs = append(n.dirs, c)
+		} else {
+			n.files = append(n.files, c)
+		}
+	}
 }
 
 // find 从当前节点开始按路径查找子节点。

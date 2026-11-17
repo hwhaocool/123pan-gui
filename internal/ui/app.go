@@ -45,6 +45,14 @@ type App struct {
 	logList   ui.ListState
 	logHeight float32
 
+	leftWidth    float32
+	fileList     ui.ListState
+	fileSelected int
+	selectedFile *Node
+	fileShownDir string
+	pendingFile  string
+	lastSelected *Node
+
 	searchQuery    string
 	searchResults  []store.SearchHit
 	searchList     ui.ListState
@@ -68,6 +76,8 @@ func NewApp() *App {
 		status:         "就绪",
 		includeSubdirs: true,
 		logHeight:      170,
+		leftWidth:      320,
+		fileSelected:   -1,
 		selectedRow:    -1,
 		searchSelected: -1,
 	}
@@ -187,15 +197,7 @@ func (a *App) View(c *ui.Context) {
 	ui.Column(c).Fill().Gap(0).Children(func() {
 		a.toolbar(c)
 		ui.Divider(c)
-		ui.SplitVertical(c, &a.logHeight, func() {
-			if a.showResults {
-				a.resultsView(c, t)
-			} else {
-				a.treeView(c, t)
-			}
-		}, func() {
-			a.logView(c, t)
-		}).Grow(1)
+		a.body(c, t)
 		ui.Divider(c)
 		a.statusBar(c, t)
 	})
@@ -243,6 +245,22 @@ func (a *App) toolbar(c *ui.Context) {
 	})
 }
 
+func (a *App) body(c *ui.Context, t *ui.Theme) {
+	ui.SplitVertical(c, &a.logHeight, func() {
+		if a.showResults {
+			a.resultsView(c, t)
+			return
+		}
+		ui.Split(c, &a.leftWidth, func() {
+			a.treeView(c, t)
+		}, func() {
+			a.filesView(c, t)
+		}).Fill()
+	}, func() {
+		a.logView(c, t)
+	}).Grow(1)
+}
+
 func (a *App) treeView(c *ui.Context, t *ui.Theme) {
 	if a.root == nil {
 		return
@@ -259,9 +277,6 @@ func (a *App) treeView(c *ui.Context, t *ui.Theme) {
 			icon.Background(t.TextMuted.Alpha(0.18))
 		}
 		ui.Text(c, n.Name()).SingleLine()
-		if !n.IsDir() {
-			ui.Text(c, FormatSize(n.Entry().Size)).TextColor(t.TextMuted).SingleLine()
-		}
 		if n.loading {
 			ui.Spinner(c)
 		}
@@ -273,7 +288,98 @@ func (a *App) treeView(c *ui.Context, t *ui.Theme) {
 	} else {
 		a.selected = nil
 	}
+
+	// 选中文件夹时立即加载（缓存优先），右侧文件列表随后就能显示内容。
+	if a.selected != a.lastSelected {
+		a.lastSelected = a.selected
+		a.fileList = ui.ListState{}
+		a.fileSelected = -1
+		a.selectedFile = nil
+		if a.selected != nil && a.selected.IsDir() &&
+			!a.selected.loaded && !a.selected.loading && !a.selected.loadFailed {
+			a.loadNode(a.selected)
+		}
+	}
+
 	a.scrollToPendingReveal(c)
+}
+
+func (a *App) filesView(c *ui.Context, t *ui.Theme) {
+	dir := a.selected
+	if dir == nil {
+		dir = a.root
+	}
+	if dir == nil || !dir.IsDir() {
+		return
+	}
+
+	if a.fileShownDir != dir.Path() {
+		a.fileShownDir = dir.Path()
+		a.fileSelected = -1
+		a.selectedFile = nil
+	}
+
+	files := dir.Files()
+
+	revealIndex := -1
+	if a.pendingFile != "" {
+		for i, f := range files {
+			if f.Path() == a.pendingFile {
+				revealIndex = i
+				a.fileSelected = i
+				break
+			}
+		}
+		if revealIndex < 0 {
+			a.pendingFile = ""
+		}
+	}
+
+	ui.Column(c).Fill().Background(t.Background).Children(func() {
+		ui.Row(c).Padding(10, 8).Gap(8).AlignItems(ui.Center).Children(func() {
+			ui.Text(c, "文件").Bold()
+			ui.Text(c, dir.DisplayPath()).TextColor(t.TextMuted).SingleLine()
+			ui.Spacer(c)
+			if dir.loading {
+				ui.Spinner(c)
+			}
+			ui.Text(c, fmt.Sprintf("%d 个文件", len(files))).TextColor(t.TextMuted)
+		})
+
+		a.fileList.Selected = &a.fileSelected
+		a.fileList.Key = func(i int) any { return files[i].Path() }
+		cols := []ui.TableColumn{
+			{Title: "名称"},
+			{Title: "大小", Width: 110, Align: ui.End},
+			{Title: "修改时间", Width: 170},
+			{Title: "ETag", Width: 140},
+		}
+		ui.Table(c, &a.fileList, cols, len(files), func(row, col int) {
+			e := files[row].Entry()
+			switch col {
+			case 0:
+				ui.Text(c, e.Name).SingleLine()
+			case 1:
+				ui.Text(c, FormatSize(e.Size))
+			case 2:
+				ui.Text(c, formatTime(e.Modified))
+			case 3:
+				ui.Text(c, e.ETag).TextColor(t.TextMuted).SingleLine()
+			}
+		}).Grow(1).Label("文件列表")
+	})
+
+	if a.fileSelected >= 0 && a.fileSelected < len(files) {
+		a.selectedFile = files[a.fileSelected]
+	} else {
+		a.selectedFile = nil
+	}
+
+	if revealIndex >= 0 {
+		a.fileList.ScrollTo(revealIndex, ui.Center)
+		a.pendingFile = ""
+		c.Invalidate()
+	}
 }
 
 func (a *App) resultsView(c *ui.Context, t *ui.Theme) {
@@ -359,6 +465,16 @@ func (a *App) alert(c *ui.Context) {
 //
 
 func (a *App) infoText() string {
+	if f := a.selectedFile; f != nil {
+		e := f.Entry()
+		etag := e.ETag
+		if etag == "" {
+			etag = "-"
+		}
+		return fmt.Sprintf("文件：%s　|　%s　|　修改于 %s　|　ETag %s",
+			f.DisplayPath(), FormatSize(e.Size), formatTime(e.Modified), etag)
+	}
+
 	n := a.selected
 	if n == nil {
 		if a.info != "" {
@@ -368,20 +484,13 @@ func (a *App) infoText() string {
 	}
 
 	if n.IsDir() {
-		dirs, files := 0, 0
-		for _, c := range n.Children() {
-			if c.IsDir() {
-				dirs++
-			} else {
-				files++
-			}
-		}
 		if n.Loaded() {
 			synced := "已加载"
 			if at, ok := a.cache.SyncedAt(n.Path()); ok {
 				synced = formatTime(at)
 			}
-			return fmt.Sprintf("目录：%s　|　%d 个子目录 / %d 个文件　|　同步于 %s", n.DisplayPath(), dirs, files, synced)
+			return fmt.Sprintf("目录：%s　|　%d 个子目录 / %d 个文件　|　同步于 %s",
+				n.DisplayPath(), len(n.dirs), len(n.files), synced)
 		}
 		return fmt.Sprintf("目录：%s　|　子项未加载（展开或点击「同步选中目录」）", n.DisplayPath())
 	}
@@ -439,6 +548,9 @@ func (a *App) reconcile() {
 		if n.IsDir() && !n.loaded && !n.loading && !n.loadFailed {
 			a.loadNode(n)
 		}
+	}
+	if n := a.selected; n != nil && n.IsDir() && !n.loaded && !n.loading && !n.loadFailed {
+		a.loadNode(n)
 	}
 }
 
@@ -541,8 +653,16 @@ func (a *App) reveal(hit store.SearchHit) {
 		a.outline.Open.Add(node)
 	}
 
+	target := node
+	a.pendingFile = ""
+	if !node.IsDir() {
+		// 文件在右侧列表里定位，树里选中它的父目录。
+		target = node.parent
+		a.pendingFile = node.Path()
+	}
+
 	a.showResults = false
-	a.pendingReveal = node
+	a.pendingReveal = target
 	a.status = "已定位：" + node.DisplayPath()
 }
 
@@ -584,6 +704,8 @@ func (a *App) bootstrap() {
 		if entries, ok := a.cache.Children("/"); ok {
 			a.applyEntries(a.root, entries)
 			a.outline.Open.Add(a.root)
+			a.selectedRow = 0
+			a.selected = a.root
 			a.addLog("已从本地数据库加载根目录（%d 项）", len(entries))
 		} else {
 			a.addLog("本地还没有根目录缓存")

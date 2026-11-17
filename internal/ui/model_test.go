@@ -49,7 +49,7 @@ func TestMergeChildrenKeepsNodes(t *testing.T) {
 	}
 }
 
-// TestOutlineChildren 验证 Outline 的展开箭头规则。
+// TestOutlineChildren 验证目录树只显示文件夹，文件进入右侧列表。
 func TestOutlineChildren(t *testing.T) {
 	root := NewRootNode()
 	root.mergeChildren([]store.Entry{
@@ -62,24 +62,48 @@ func TestOutlineChildren(t *testing.T) {
 	empty := root.children[1]
 	file := root.children[2]
 
+	root.loaded = true
+
+	// 根目录的文件也不会出现在目录树里。
+	if got := root.outlineChildren(); got == nil || len(got) != 2 {
+		t.Fatalf("root dirs = %#v", got)
+	}
+	if files := root.Files(); len(files) != 1 || files[0] != file {
+		t.Fatalf("root files = %#v", files)
+	}
+
 	// 未加载的文件夹：非 nil 空切片（显示箭头，展开后触发加载）。
 	if got := dir.outlineChildren(); got == nil || len(got) != 0 {
 		t.Fatalf("unloaded dir children = %#v", got)
 	}
-	// 文件：叶子。
-	if got := file.outlineChildren(); got != nil {
-		t.Fatalf("file children = %#v", got)
-	}
+
 	// 已加载的空文件夹：叶子。
 	empty.loaded = true
 	if got := empty.outlineChildren(); got != nil {
 		t.Fatalf("empty loaded dir children = %#v", got)
 	}
-	// 已加载且有子项。
+
+	// 已加载且有子文件夹 + 文件：树里只有子文件夹，文件进 Files。
 	dir.loaded = true
-	dir.mergeChildren([]store.Entry{{Name: "x", Size: 1}})
-	if got := dir.outlineChildren(); len(got) != 1 {
-		t.Fatalf("loaded dir children = %#v", got)
+	dir.mergeChildren([]store.Entry{
+		{Name: "sub", IsDir: true},
+		{Name: "inside.txt", Size: 2},
+	})
+	dirs := dir.outlineChildren()
+	if len(dirs) != 1 || dirs[0].Name() != "sub" {
+		t.Fatalf("dirs = %#v", dirs)
+	}
+	if files := dir.Files(); len(files) != 1 || files[0].Name() != "inside.txt" {
+		t.Fatalf("files = %#v", files)
+	}
+
+	// 只有文件的已加载目录：不再显示展开箭头。
+	dir.mergeChildren([]store.Entry{{Name: "only.txt", Size: 3}})
+	if got := dir.outlineChildren(); got != nil {
+		t.Fatalf("file-only dir children = %#v", got)
+	}
+	if files := dir.Files(); len(files) != 1 || files[0].Name() != "only.txt" {
+		t.Fatalf("files = %#v", files)
 	}
 }
 
