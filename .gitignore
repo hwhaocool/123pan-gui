@@ -8,9 +8,10 @@ config.json.tmp
 
 # 本地 SQLite 缓存
 /tree.db
+/tree.db.bad
+# 历史 WAL 模式遗留（新版本自动清理）
 /tree.db-wal
 /tree.db-shm
-/tree.db.bad
 /tree.db-journal
 
 # 本地运行日志

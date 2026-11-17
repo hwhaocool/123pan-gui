@@ -82,7 +82,7 @@ go build -trimpath -ldflags "-H windowsgui" -o 123pan-client.exe .
 | 文件 | 说明 |
 | --- | --- |
 | `config.json` | WebDAV 地址 / 用户名 / 密码 / 是否忽略证书 / QPS |
-| `tree.db` | SQLite 目录树缓存（含 `tree.db-wal`、`tree.db-shm`） |
+| `tree.db` | SQLite 目录树缓存（使用 DELETE 日志模式，**不会产生** `-wal`/`-shm` 常驻文件） |
 
 > `config.json` 内含密码，已和 `tree.db*` 一起加入 `.gitignore`，不要提交或分享。
 
@@ -162,7 +162,7 @@ internal/
 - **懒加载 + 占位子项**：`TreeModel.LazyPopulation() = true`，未展开的子树不插入控件；而未同步的文件夹会带一个灰色占位子项——因为 ComCtl32 的 TreeView 只有节点「确实有子项」时才允许展开，否则点击展开箭头毫无反应，懒加载/自动同步永远不会触发。同步完成后占位子项被真实子项整体替换。
 - **限速在客户端层**：`webdav.Limiter` 保证两次请求之间至少间隔 `1/QPS`，同步 worker 是单 goroutine，所以「手动同步 + 展开自动同步」也不会并发冲击服务端。
 - **可取消**：每个同步任务一个 `context`，停止按钮会取消当前任务并清空队列；网络请求和限速等待都响应取消。
-- **SQLite 单连接**：`MaxOpenConns(1)` + WAL，避免并发写锁冲突；同步过程中定期 `wal_checkpoint`，便于拷贝数据库。
+- **SQLite 单连接 + DELETE 日志模式**：`MaxOpenConns(1)` 避免并发写锁冲突；`journal_mode=DELETE`，每次提交后日志即刻删除，所以目录里只有 `tree.db` 一个文件（不会常驻 `tree.db-wal` / `tree.db-shm`）。老版本的 WAL 数据库会在启动时自动切换回 DELETE 并清理残留文件。
 - **本地搜索**：`SELECT ... WHERE sort_name LIKE ? ESCAPE '\'`，`sort_name` 是 Go `strings.ToLower` 后的小写名称（Unicode 友好）；用户输入里的 `%`/`_` 会被转义，不会变成通配符。结果按「完全匹配 > 前缀 > 包含」排序，其次名称更短、文件夹优先。整个过程只读 SQLite，不产生任何 WebDAV 请求。
 
 ## 已知限制

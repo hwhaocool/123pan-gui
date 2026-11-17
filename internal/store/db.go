@@ -66,8 +66,10 @@ func Open(path string) (*Cache, error) {
 		return nil, fmt.Errorf("创建数据库目录失败: %w", err)
 	}
 
+	// 使用 DELETE 日志模式：不产生常驻的 -wal / -shm 文件，数据库目录更干净。
+	// （单连接场景下 WAL 的并发优势用不上，写入提交后日志文件即刻删除。）
 	dsn := "file:" + filepath.ToSlash(path) +
-		"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)"
+		"?_pragma=busy_timeout(5000)&_pragma=journal_mode(DELETE)&_pragma=synchronous(NORMAL)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("打开数据库失败: %w", err)
@@ -86,7 +88,40 @@ func Open(path string) (*Cache, error) {
 		return nil, fmt.Errorf("初始化数据库失败: %w", err)
 	}
 
+	// 老版本用的是 WAL 模式：这里兜底切回 DELETE，并清理可能残留的 -wal / -shm。
+	if err := ensureDeleteJournal(db); err != nil {
+		db.Close()
+		return nil, err
+	}
+	cleanupSidecarFiles(path)
+
 	return &Cache{db: db, path: path}, nil
+}
+
+// ensureDeleteJournal 确保数据库使用 DELETE 日志模式。
+func ensureDeleteJournal(db *sql.DB) error {
+	var mode string
+	if err := db.QueryRow(`PRAGMA journal_mode`).Scan(&mode); err != nil {
+		return fmt.Errorf("读取日志模式失败: %w", err)
+	}
+	if strings.EqualFold(mode, "delete") {
+		return nil
+	}
+	if _, err := db.Exec(`PRAGMA journal_mode=DELETE`); err != nil {
+		return fmt.Errorf("切换数据库日志模式失败: %w", err)
+	}
+	return nil
+}
+
+// cleanupSidecarFiles 删除 WAL 模式遗留的 -wal / -shm 文件（尽力而为）。
+// 删除失败（例如仍被占用）不影响使用，下次启动会再试。
+func cleanupSidecarFiles(path string) {
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if err := os.Remove(path + suffix); err != nil && !os.IsNotExist(err) {
+			// 忽略：可能是旧的共享内存映射尚未释放，下次启动会再清理。
+			_ = err
+		}
+	}
 }
 
 // Path 返回数据库文件路径。
@@ -100,14 +135,15 @@ func (c *Cache) Close() error {
 	return c.db.Close()
 }
 
-// Flush 把 WAL 合并回主数据库文件，便于拷贝/备份。
+// Flush 在同步过程中被周期性调用：DELETE 模式下每次写入已提交到主文件，
+// 这里只做一次轻量的 PRAGMA optimize（不会产生额外文件）。
 func (c *Cache) Flush() error {
 	if c == nil || c.db == nil {
 		return nil
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	_, err := c.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`)
+	_, err := c.db.Exec(`PRAGMA optimize`)
 	return err
 }
 

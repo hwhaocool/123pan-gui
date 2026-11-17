@@ -1,8 +1,10 @@
 package store
 
 import (
+	"database/sql"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -293,4 +295,93 @@ func hitNames(hits []SearchHit) []string {
 		out[i] = h.Path
 	}
 	return out
+}
+
+// TestNoSidecarJournalFiles 验证使用 DELETE 日志模式：运行期间和退出后都不会留下 -wal/-shm。
+func TestNoSidecarJournalFiles(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "tree.db")
+
+	c, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	var mode string
+	if err := c.db.QueryRow(`PRAGMA journal_mode`).Scan(&mode); err != nil {
+		t.Fatalf("journal_mode: %v", err)
+	}
+	if !strings.EqualFold(mode, "delete") {
+		t.Fatalf("journal_mode = %q, want delete", mode)
+	}
+
+	if err := c.SetFolder("/", []Entry{{Name: "a.txt", Size: 1}}); err != nil {
+		t.Fatalf("SetFolder: %v", err)
+	}
+	if err := c.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
+		if _, err := os.Stat(path + suffix); !os.IsNotExist(err) {
+			t.Fatalf("unexpected sidecar file %s (err=%v)", path+suffix, err)
+		}
+	}
+
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
+		if _, err := os.Stat(path + suffix); !os.IsNotExist(err) {
+			t.Fatalf("sidecar %s left after close (err=%v)", path+suffix, err)
+		}
+	}
+}
+
+// TestMigratesFromWAL 验证老版本 WAL 数据库打开后会切回 DELETE 模式且数据不丢。
+func TestMigratesFromWAL(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "tree.db")
+
+	raw, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+"?_pragma=journal_mode(WAL)")
+	if err != nil {
+		t.Fatalf("open raw: %v", err)
+	}
+	if _, err := raw.Exec(schema); err != nil {
+		t.Fatalf("schema: %v", err)
+	}
+	if _, err := raw.Exec(`INSERT INTO folder(path, synced_at) VALUES('/', ?)`, time.Now().UnixNano()); err != nil {
+		t.Fatalf("insert folder: %v", err)
+	}
+	if _, err := raw.Exec(`INSERT INTO entry(parent, name, sort_name, is_dir, size) VALUES('/', '老数据.txt', '老数据.txt', 0, 42)`); err != nil {
+		t.Fatalf("insert entry: %v", err)
+	}
+	var rawMode string
+	if err := raw.QueryRow(`PRAGMA journal_mode`).Scan(&rawMode); err != nil || !strings.EqualFold(rawMode, "wal") {
+		t.Fatalf("raw journal_mode = %q, %v", rawMode, err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw: %v", err)
+	}
+
+	c, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer c.Close()
+
+	var mode string
+	if err := c.db.QueryRow(`PRAGMA journal_mode`).Scan(&mode); err != nil || !strings.EqualFold(mode, "delete") {
+		t.Fatalf("journal_mode = %q, %v", mode, err)
+	}
+	entries, ok := c.Children("/")
+	if !ok || len(entries) != 1 || entries[0].Name != "老数据.txt" || entries[0].Size != 42 {
+		t.Fatalf("entries = %+v, ok=%v", entries, ok)
+	}
+	if _, err := os.Stat(path + "-wal"); !os.IsNotExist(err) {
+		t.Fatalf("wal file left behind (err=%v)", err)
+	}
+	if _, err := os.Stat(path + "-shm"); !os.IsNotExist(err) {
+		t.Fatalf("shm file left behind (err=%v)", err)
+	}
 }
