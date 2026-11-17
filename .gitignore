@@ -1,0 +1,11 @@
+# 构建产物
+*.exe
+rsrc.syso
+
+# 本地运行日志
+run.log
+*.log
+
+# 编辑器
+.idea/
+.vscode/
