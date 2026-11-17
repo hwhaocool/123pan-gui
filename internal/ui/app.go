@@ -41,9 +41,9 @@ type App struct {
 	status         string
 	info           string
 
-	logs      []string
-	logList   ui.ListState
-	logHeight float32
+	logs       []string
+	logList    ui.ListState
+	topPercent float32 // 上方面板（目录树 + 文件列表）占高度百分比
 
 	leftWidth    float32
 	fileList     ui.ListState
@@ -75,7 +75,7 @@ func NewApp() *App {
 	a := &App{
 		status:         "就绪",
 		includeSubdirs: true,
-		logHeight:      170,
+		topPercent:     74,
 		leftWidth:      320,
 		fileSelected:   -1,
 		selectedRow:    -1,
@@ -246,7 +246,7 @@ func (a *App) toolbar(c *ui.Context) {
 }
 
 func (a *App) body(c *ui.Context, t *ui.Theme) {
-	ui.SplitVertical(c, &a.logHeight, func() {
+	ui.SplitVerticalPercent(c, &a.topPercent, func() {
 		if a.showResults {
 			a.resultsView(c, t)
 			return
@@ -258,7 +258,7 @@ func (a *App) body(c *ui.Context, t *ui.Theme) {
 		}).Fill()
 	}, func() {
 		a.logView(c, t)
-	}).Grow(1)
+	}).SplitReset(74).Grow(1)
 }
 
 func (a *App) treeView(c *ui.Context, t *ui.Theme) {
