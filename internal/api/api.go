@@ -21,6 +21,10 @@ import (
 // DefaultBaseURL 是 123 云盘开放平台地址。
 const DefaultBaseURL = "https://open-api.123pan.com"
 
+// tokenRefreshSkew 表示在 access_token 过期前多久主动重新获取。
+// 开放平台文档要求：拿到 token 后本地保存，并在过期前及时重新获取。
+const tokenRefreshSkew = 5 * time.Minute
+
 // FileInfo 对应 /api/v2/file/list 返回的 fileList 元素。
 type FileInfo struct {
 	FileID       int64  `json:"fileId"`
@@ -151,6 +155,8 @@ type Client struct {
 	http    *http.Client // 受 mu 保护，Configure 时会整体替换
 	limiter *Limiter
 
+	loginMu sync.Mutex // 保证同一时刻只有一个换取 token 的请求
+
 	mu           sync.RWMutex
 	baseURL      string
 	pageSize     int
@@ -243,45 +249,98 @@ func (c *Client) TokenExpiredAt() time.Time {
 	return c.expiredAt
 }
 
-// EnsureToken 保证有一个可用的 access_token；如果配置了 clientID/clientSecret
-// 且当前 token 为空或已过期，会自动换取并回调 OnToken。
-func (c *Client) EnsureToken(ctx context.Context) error {
+// TokenState 返回当前 access_token 及其过期时间。
+func (c *Client) TokenState() (token string, expiredAt time.Time) {
 	c.mu.RLock()
-	token, expiredAt := c.token, c.expiredAt
-	clientID, clientSecret := c.clientID, c.clientSecret
-	c.mu.RUnlock()
+	defer c.mu.RUnlock()
+	return c.token, c.expiredAt
+}
 
-	valid := token != ""
-	if valid && !expiredAt.IsZero() && !time.Now().Before(expiredAt.Add(-2*time.Minute)) {
-		valid = false
+// CanAutoRefresh 表示是否配置了 clientID/clientSecret（可自动换取 token）。
+func (c *Client) CanAutoRefresh() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.clientID != "" && c.clientSecret != ""
+}
+
+// NeedsRefresh 表示当前 token 缺失、已过期或即将过期（默认提前 5 分钟）。
+func (c *Client) NeedsRefresh() bool {
+	token, expiredAt := c.TokenState()
+	if token == "" {
+		return true
 	}
-	if valid {
+	if expiredAt.IsZero() {
+		// 不知道有效期（例如用户手工粘贴的 token），先直接使用，
+		// 真过期了会被接口 401 拦截并自动重新获取。
+		return false
+	}
+	return !time.Now().Add(tokenRefreshSkew).Before(expiredAt)
+}
+
+// EnsureToken 保证有一个可用的 access_token：
+//   - 未配置任何凭证 -> ErrNotConfigured；
+//   - token 仍有效 -> 直接返回；
+//   - token 缺失/已过期/5 分钟内过期 -> 用 clientID/clientSecret 自动换取，
+//     并通过 OnToken 回调把新 token 与过期时间交回调用方持久化。
+func (c *Client) EnsureToken(ctx context.Context) error {
+	if !c.NeedsRefresh() {
 		return nil
 	}
-	if clientID == "" || clientSecret == "" {
+
+	token, _ := c.TokenState()
+	if !c.CanAutoRefresh() {
 		if token != "" {
-			// 有过期时间但已过期，仍尝试用旧 token 一次，交给 401 逻辑处理。
+			// 有旧 token 但没有 clientID/clientSecret：先尝试用旧 token，
+			// 真失效时由 401 逻辑报出明确错误。
 			return nil
 		}
 		return ErrNotConfigured
 	}
 
-	if err := c.login(ctx); err != nil {
-		return err
-	}
-	return nil
+	_, err := c.refreshToken(ctx, false)
+	return err
 }
 
-// login 使用 clientID/clientSecret 换取 access_token。
-func (c *Client) login(ctx context.Context) error {
+// RefreshToken 强制重新获取 access_token（供设置界面「立即获取」使用）。
+func (c *Client) RefreshToken(ctx context.Context) (time.Time, error) {
+	return c.refreshToken(ctx, true)
+}
+
+// refreshToken 在 loginMu 保护下换取 token，避免并发重复请求。
+func (c *Client) refreshToken(ctx context.Context, force bool) (time.Time, error) {
+	c.loginMu.Lock()
+	defer c.loginMu.Unlock()
+
+	if !force && !c.NeedsRefresh() {
+		return c.TokenExpiredAt(), nil
+	}
+
 	c.mu.RLock()
 	clientID, clientSecret, baseURL := c.clientID, c.clientSecret, c.baseURL
 	c.mu.RUnlock()
 
-	body, _ := json.Marshal(map[string]string{"clientID": clientID, "clientSecret": clientSecret})
-	data, err := c.do(ctx, http.MethodPost, baseURL+"/api/v1/access_token", body, nil)
+	if clientID == "" || clientSecret == "" {
+		return time.Time{}, fmt.Errorf("%w（缺少 clientID/clientSecret，无法自动获取）", ErrNotConfigured)
+	}
+
+	return c.requestToken(ctx, baseURL, clientID, clientSecret)
+}
+
+// requestToken 调用 POST /api/v1/access_token 换取 token。
+// 文档：https://123yunpan.yuque.com/org-wiki-123yunpan-muaork/cr6ced/gn1nai4x0v0ry9ki
+func (c *Client) requestToken(ctx context.Context, baseURL, clientID, clientSecret string) (time.Time, error) {
+	body, err := json.Marshal(map[string]string{"clientID": clientID, "clientSecret": clientSecret})
 	if err != nil {
-		return fmt.Errorf("换取 access_token 失败: %w", err)
+		return time.Time{}, err
+	}
+
+	headers := map[string]string{
+		"Platform": "open_platform",
+		"Accept":   "application/json",
+	}
+	data, err := c.do(ctx, http.MethodPost, baseURL+"/api/v1/access_token", body, headers)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("换取 access_token 失败: %w", err)
 	}
 
 	var resp struct {
@@ -293,16 +352,19 @@ func (c *Client) login(ctx context.Context) error {
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
-		return fmt.Errorf("解析 access_token 响应失败: %w", err)
+		return time.Time{}, fmt.Errorf("解析 access_token 响应失败: %w", err)
 	}
 	if resp.Code != 0 {
-		return &APIError{Code: resp.Code, Message: resp.Message}
+		return time.Time{}, &APIError{Code: resp.Code, Message: resp.Message}
 	}
 	if resp.Data.AccessToken == "" {
-		return errors.New("换取 access_token 失败: 响应中没有 accessToken")
+		return time.Time{}, errors.New("换取 access_token 失败: 响应中没有 accessToken")
 	}
 
 	expiredAt := parseTime(resp.Data.ExpiredAt)
+	if expiredAt.IsZero() && resp.Data.ExpiredAt != "" {
+		return time.Time{}, fmt.Errorf("无法解析 access_token 过期时间 %q", resp.Data.ExpiredAt)
+	}
 
 	c.mu.Lock()
 	c.token = resp.Data.AccessToken
@@ -313,7 +375,8 @@ func (c *Client) login(ctx context.Context) error {
 	if cb != nil {
 		cb(resp.Data.AccessToken, expiredAt)
 	}
-	return nil
+
+	return expiredAt, nil
 }
 
 // invalidateToken 丢弃当前 token，迫使下次请求重新换取。

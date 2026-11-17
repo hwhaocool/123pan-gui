@@ -52,8 +52,8 @@ go build -trimpath -ldflags "-H windowsgui" -o 123pan-client.exe .
 
 ## 使用
 
-1. 登录 [123 云盘开放平台](https://www.123pan.com/developer) 控制台，创建应用，获取 **access_token**（或 clientID + clientSecret）。
-2. 启动程序 → 点「设置…」→ 填写鉴权信息 → 保存。
+1. 登录 [123 云盘开放平台](https://www.123pan.com/developer) 控制台，创建应用，获取 **clientID + clientSecret**（或直接拿 access_token）。
+2. 启动程序 → 点「设置…」→ 填写 `clientID`/`clientSecret` → 保存。程序会自动换取 access_token 并写入当前目录的 `config.json`。
 3. 首次启动会自动同步根目录第一层；之后在树上选中任意目录，点「同步选中目录」即可。
 
 ### 操作提示
@@ -69,13 +69,13 @@ go build -trimpath -ldflags "-H windowsgui" -o 123pan-client.exe .
 
 ## 数据存放
 
-`%APPDATA%\123pan-client\`
+| 文件 | 位置 | 说明 |
+| --- | --- | --- |
+| `config.json` | **程序当前工作目录**（通常就是 exe 所在目录） | access_token / tokenExpiredAt / clientID / clientSecret / QPS / 每页条数 / 服务地址 |
+| `tree.json` | `%APPDATA%\123pan-client\` | 目录树缓存（可再生成，所以不放在程序目录） |
+| `tree.json.bad` | `%APPDATA%\123pan-client\` | 缓存损坏时的自动备份 |
 
-| 文件 | 说明 |
-| --- | --- |
-| `config.json` | access_token / clientID / clientSecret / QPS / 每页条数 / 服务地址 |
-| `tree.json` | 目录树缓存 |
-| `tree.json.bad` | 缓存损坏时的自动备份 |
+> `config.json` 内含凭证，已加入 `.gitignore`，不要提交或分享。
 
 缓存结构是「**父目录 ID → 该目录的直接子项列表**」：
 
@@ -89,13 +89,28 @@ go build -trimpath -ldflags "-H windowsgui" -o 123pan-client.exe .
 ```json
 {
   "accessToken": "eyJhbGciOi...",
-  "clientId": "",
-  "clientSecret": "",
+  "tokenExpiredAt": "2025-03-23T15:48:37+08:00",
+  "clientId": "123456789",
+  "clientSecret": "123456789",
   "qps": 1,
   "pageSize": 100,
   "baseUrl": "https://open-api.123pan.com"
 }
 ```
+
+## access_token 自动获取
+
+开放平台文档：<https://123yunpan.yuque.com/org-wiki-123yunpan-muaork/cr6ced/gn1nai4x0v0ry9ki>
+
+只填 `clientId` + `clientSecret`（`accessToken` 留空）即可全自动：
+
+1. 启动时 / 每次同步前检查 `accessToken` 是否缺失、已过期或 **5 分钟内即将过期**；
+2. 需要时调用 `POST /api/v1/access_token`（Header: `Platform: open_platform`，Body: `clientID`、`clientSecret`）换取新 token；
+3. 把返回的 `accessToken` 与 `expiredAt` 写入 `config.json`（`tokenExpiredAt`），下次启动直接复用；
+4. 接口返回 401 / token 无效时，自动丢弃旧 token、重新获取并重试一次；
+5. 设置对话框里显示当前 token 状态，也可以点「立即获取 access_token」强制刷新。
+
+同时填写了 `accessToken` 与 `clientId/clientSecret` 时：优先使用本地 token，直到它过期前 5 分钟再自动续期。
 
 `baseUrl` 可以在配置文件里改成自建的反向代理地址（设置界面未暴露该字段）。
 
@@ -126,7 +141,7 @@ build.bat                一键构建脚本
 internal/
   api/api.go             123 云盘 OpenAPI 客户端：文件列表翻页、token 换取、限速、重试
   api/api_test.go        翻页 / 回收站过滤 / token 换取 / 错误处理测试
-  config/config.go       配置读写（%APPDATA%\123pan-client\config.json）
+  config/config.go       配置读写（当前目录的 config.json）与缓存路径
   store/cache.go         本地目录树缓存（原子写、损坏自愈、排序、过滤回收站）
   store/cache_test.go    缓存测试
   ui/app.go              主窗口、按钮 / 展开 / 选中事件、日志与状态栏
@@ -153,4 +168,4 @@ internal/
 
 ## 安全提示
 
-本项目是**个人本地使用**的工具：`access_token` 以明文保存在 `%APPDATA%\123pan-client\config.json`，请勿把该文件或 token 分享给他人。
+本项目是**个人本地使用**的工具：`access_token` / `clientSecret` 以明文保存在程序目录下的 `config.json`，请勿把该文件或 token 分享给他人（该文件已在 `.gitignore` 中）。

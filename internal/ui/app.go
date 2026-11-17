@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -119,6 +118,25 @@ func (a *App) init() error {
 	}
 
 	return nil
+}
+
+// checkAuth 检查/自动续期 access_token，并更新日志与状态栏。
+func (a *App) checkAuth(ctx context.Context) error {
+	if err := a.client.EnsureToken(ctx); err != nil {
+		a.logf("鉴权失败：%v", err)
+		a.setInfo("鉴权失败，请检查设置")
+		return err
+	}
+	a.logAuthStatus()
+	return nil
+}
+
+// logAuthStatus 把当前 token 状态写进日志和状态栏。
+func (a *App) logAuthStatus() {
+	token, expiredAt := a.client.TokenState()
+	status := describeToken(token, expiredAt, a.client.CanAutoRefresh())
+	a.logf("%s", status)
+	a.setInfo(status)
 }
 
 func (a *App) clientOptions() api.Options {
@@ -235,7 +253,7 @@ func (a *App) bootstrap() {
 	time.Sleep(150 * time.Millisecond)
 
 	a.logf("123 云盘客户端已启动")
-	a.logf("数据目录：%s", filepath.Dir(a.cache.Path()))
+	a.logf("配置文件：%s", a.cfgPath)
 	a.logf("缓存文件：%s", a.cache.Path())
 	a.logf("限速：QPS=%.1f（两次请求最小间隔 %s），可在「设置…」中调整", a.client.QPS(), a.client.Interval())
 
@@ -262,9 +280,11 @@ func (a *App) bootstrap() {
 		return
 	}
 
-	if err := a.client.EnsureToken(context.Background()); err != nil {
-		a.logf("鉴权失败：%v", err)
-		a.setInfo("鉴权失败，请检查设置")
+	a.logf("鉴权方式：%s", authMode(a.cfg))
+	if a.client.NeedsRefresh() && a.client.CanAutoRefresh() {
+		a.logf("access_token 缺失或即将过期，正在自动获取…")
+	}
+	if err := a.checkAuth(context.Background()); err != nil {
 		return
 	}
 	a.setInfo(fmt.Sprintf("鉴权正常 · QPS %.1f", a.client.QPS()))

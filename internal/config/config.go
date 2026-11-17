@@ -1,8 +1,12 @@
 // Package config 负责配置文件与本地缓存目录。
+//
+//   - config.json 保存在「程序当前工作目录」（通常就是 exe 所在目录），方便查看/携带；
+//   - 目录树缓存较大且属于可再生成的数据，仍放在 %APPDATA%\123pan-client。
 package config
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -16,20 +20,26 @@ const (
 	DefaultQPS = 1.0
 	// DefaultPageSize 是文件列表接口的每页条数上限（接口最大 100）。
 	DefaultPageSize = 100
+
+	// ConfigFileName / CacheFileName 是固定文件名。
+	ConfigFileName = "config.json"
+	CacheFileName  = "tree.json"
 )
 
 // Config 是持久化到 config.json 的配置。
 type Config struct {
+	// AccessToken 是 openapi 访问凭证；可由 clientID/clientSecret 自动获取并回写到本地。
 	AccessToken    string    `json:"accessToken,omitempty"`
-	TokenExpiredAt time.Time `json:"tokenExpiredAt,omitempty"`
-	ClientID       string    `json:"clientId,omitempty"`
-	ClientSecret   string    `json:"clientSecret,omitempty"`
+	TokenExpiredAt time.Time `json:"tokenExpiredAt,omitzero"`
+	// ClientID/ClientSecret 用于自动换取 access_token。
+	ClientID     string `json:"clientId,omitempty"`
+	ClientSecret string `json:"clientSecret,omitempty"`
 
 	QPS      float64 `json:"qps"`
 	PageSize int     `json:"pageSize"`
 	BaseURL  string  `json:"baseUrl"`
 
-	LastSyncAt time.Time `json:"lastSyncAt,omitempty"`
+	LastSyncAt time.Time `json:"lastSyncAt,omitzero"`
 }
 
 // Default 返回一份默认配置。
@@ -57,8 +67,29 @@ func (c *Config) Sanitize() {
 	}
 }
 
-// Dir 返回应用数据目录（%APPDATA%\123pan-client）。
-func Dir() (string, error) {
+// WorkDir 返回 config.json 所在目录：程序当前工作目录。
+// 若工作目录不可用（例如被删除），回退到可执行文件所在目录。
+func WorkDir() (string, error) {
+	if wd, err := os.Getwd(); err == nil && wd != "" {
+		return wd, nil
+	}
+	if exe, err := os.Executable(); err == nil {
+		return filepath.Dir(exe), nil
+	}
+	return "", errors.New("无法确定程序工作目录")
+}
+
+// ConfigPath 返回配置文件路径（当前工作目录下的 config.json）。
+func ConfigPath() (string, error) {
+	d, err := WorkDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(d, ConfigFileName), nil
+}
+
+// AppDataDir 返回缓存目录（%APPDATA%\123pan-client）。
+func AppDataDir() (string, error) {
 	if d := os.Getenv("APPDATA"); d != "" {
 		return filepath.Join(d, "123pan-client"), nil
 	}
@@ -69,22 +100,13 @@ func Dir() (string, error) {
 	return filepath.Join(d, "123pan-client"), nil
 }
 
-// ConfigPath 返回配置文件路径。
-func ConfigPath() (string, error) {
-	d, err := Dir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(d, "config.json"), nil
-}
-
 // CachePath 返回目录树缓存文件路径。
 func CachePath() (string, error) {
-	d, err := Dir()
+	d, err := AppDataDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(d, "tree.json"), nil
+	return filepath.Join(d, CacheFileName), nil
 }
 
 // Load 读取配置；文件不存在时返回默认配置（不报错）。
