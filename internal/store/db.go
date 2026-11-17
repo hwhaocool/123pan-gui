@@ -13,6 +13,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -341,6 +342,40 @@ func (c *Cache) Remove(dir string) error {
 	if _, err := tx.Exec(`DELETE FROM folder WHERE path = ?`, dir); err != nil {
 		return err
 	}
+	return tx.Commit()
+}
+
+// Delete 删除某个条目的本地缓存：父目录中的这一项，以及（如果它是目录）
+// 整棵子树的 entry / folder 记录。仅影响缓存，不访问网络。
+func (c *Cache) Delete(p string) error {
+	p = NormalizePath(p)
+	if p == "/" {
+		return fmt.Errorf("不能删除根目录缓存")
+	}
+
+	parent := path.Dir(p)
+	name := path.Base(p)
+	subtree := escapeLike(p) + "/%"
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	tx, err := c.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`DELETE FROM entry WHERE parent = ? AND name = ?`, parent, name); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM entry WHERE parent = ? OR parent LIKE ? ESCAPE '\'`, p, subtree); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM folder WHERE path = ? OR path LIKE ? ESCAPE '\'`, p, subtree); err != nil {
+		return err
+	}
+
 	return tx.Commit()
 }
 

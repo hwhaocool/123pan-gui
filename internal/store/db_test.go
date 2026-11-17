@@ -449,3 +449,57 @@ CREATE TABLE entry (
 		t.Fatalf("SetFolder after migration: %v", err)
 	}
 }
+
+// TestDeleteEntryAndSubtree 验证删除文件与目录（含子树）的缓存清理。
+func TestDeleteEntryAndSubtree(t *testing.T) {
+	c, err := Open(filepath.Join(t.TempDir(), "tree.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { c.Close() })
+
+	if err := c.SetFolder("/", []Entry{{Name: "dir", IsDir: true}, {Name: "a.txt"}}); err != nil {
+		t.Fatalf("SetFolder: %v", err)
+	}
+	if err := c.SetFolder("/dir", []Entry{{Name: "sub", IsDir: true}, {Name: "b.txt"}}); err != nil {
+		t.Fatalf("SetFolder: %v", err)
+	}
+	if err := c.SetFolder("/dir/sub", []Entry{{Name: "c.txt"}}); err != nil {
+		t.Fatalf("SetFolder: %v", err)
+	}
+
+	// 删除单个文件：父目录少一项，其它目录不受影响。
+	if err := c.Delete("/dir/b.txt"); err != nil {
+		t.Fatalf("Delete file: %v", err)
+	}
+	children, ok := c.Children("/dir")
+	if !ok || len(children) != 1 || children[0].Name != "sub" {
+		t.Fatalf("children = %v, ok=%v", children, ok)
+	}
+
+	// 删除目录：整棵子树都清掉。
+	if err := c.Delete("/dir"); err != nil {
+		t.Fatalf("Delete dir: %v", err)
+	}
+	root, ok := c.Children("/")
+	if !ok || len(root) != 1 || root[0].Name != "a.txt" {
+		t.Fatalf("root = %v, ok=%v", root, ok)
+	}
+	if _, ok := c.Children("/dir"); ok {
+		t.Fatal("/dir should be gone")
+	}
+	if _, ok := c.Children("/dir/sub"); ok {
+		t.Fatal("/dir/sub should be gone")
+	}
+	if _, ok := c.SyncedAt("/dir/sub"); ok {
+		t.Fatal("/dir/sub synced_at should be gone")
+	}
+
+	// 删除不存在的条目不是错误；根目录不允许删除。
+	if err := c.Delete("/nope.txt"); err != nil {
+		t.Fatalf("Delete missing: %v", err)
+	}
+	if err := c.Delete("/"); err == nil {
+		t.Fatal("deleting root cache should fail")
+	}
+}

@@ -67,6 +67,10 @@ type App struct {
 
 	confirmSyncAll bool
 
+	deleting     bool
+	deleteTarget *Node
+	deleteOpen   bool
+
 	initErr error
 }
 
@@ -355,6 +359,7 @@ func (a *App) filesView(c *ui.Context, t *ui.Theme) {
 			{Title: "大小", Width: 100, Align: ui.End},
 			{Title: "创建时间", Width: 165},
 			{Title: "修改时间", Width: 165},
+			{Title: "", Width: 44, Align: ui.Center},
 		}
 		if ui.Table(c, &a.fileList, cols, len(entries), func(row, col int) {
 			e := entries[row].Entry()
@@ -376,6 +381,16 @@ func (a *App) filesView(c *ui.Context, t *ui.Theme) {
 				ui.Text(c, formatTime(e.Created)).TextColor(t.TextMuted)
 			case 3:
 				ui.Text(c, formatTime(e.Modified)).TextColor(t.TextMuted)
+			case 4:
+				node := entries[row]
+				ui.Button(c, "").
+					Label("删除").
+					Tooltip("删除「" + node.Name() + "」").
+					Disabled(a.busy || a.deleting).
+					OnClick(func() { a.askDelete(node) }).
+					Children(func() {
+						ui.Icon(c, iconTrash).Size(16, 16).TextColor(t.Danger)
+					})
 			}
 		}).Grow(1).Label("文件列表").Submitted() {
 			if a.fileSelected >= 0 && a.fileSelected < len(entries) && entries[a.fileSelected].IsDir() {
@@ -502,6 +517,21 @@ func (a *App) statusBar(c *ui.Context, t *ui.Theme) {
 }
 
 func (a *App) alert(c *ui.Context) {
+	if a.deleteTarget != nil {
+		title := "删除「" + a.deleteTarget.Name() + "」？"
+		message := "会从 WebDAV 服务器删除该文件，无法撤销。"
+		if a.deleteTarget.IsDir() {
+			message = "会递归删除该文件夹及其全部内容，无法撤销。"
+		}
+		if ret := ui.AlertDialog(c, &a.deleteOpen, title, message, "取消", "删除"); ret >= 0 {
+			target := a.deleteTarget
+			a.deleteTarget = nil
+			if ret == 1 {
+				a.deleteNode(target)
+			}
+		}
+	}
+
 	if ui.AlertDialog(c, &a.confirmSyncAll, "同步全部",
 		"将递归同步整个 WebDAV 目录树；目录较多时可能需要较长时间，是否继续？",
 		"取消", "开始同步") == 1 {
@@ -565,6 +595,11 @@ func (a *App) syncAll() {
 }
 
 func (a *App) submitSync(n *Node, recursive bool) {
+	if a.deleting {
+		a.addLog("正在删除，请稍后再同步")
+		a.status = "正在删除"
+		return
+	}
 	if !a.client.Configured() {
 		a.addLog("尚未配置 WebDAV 地址，请打开「设置…」")
 		a.status = "未配置 WebDAV"
@@ -576,6 +611,99 @@ func (a *App) submitSync(n *Node, recursive bool) {
 		return
 	}
 	a.addLog("已加入同步队列：%s（%s）", n.DisplayPath(), onOff(recursive, "含子目录", "仅本层"))
+}
+
+// askDelete 弹出删除确认。
+func (a *App) askDelete(n *Node) {
+	if n == nil || n.parent == nil {
+		return
+	}
+	if a.busy {
+		a.addLog("正在同步，暂时不能删除")
+		a.status = "请等待同步结束"
+		return
+	}
+	if a.deleting {
+		return
+	}
+	a.deleteTarget = n
+	a.deleteOpen = true
+}
+
+// deleteNode 调用 WebDAV DELETE 删除条目，然后清理本地缓存与界面。
+func (a *App) deleteNode(n *Node) {
+	if n == nil || n.parent == nil || a.deleting {
+		return
+	}
+
+	path := n.Path()
+	isDir := n.IsDir()
+	display := n.DisplayPath()
+
+	a.deleting = true
+	a.status = "正在删除：" + display
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+
+		err := a.client.Delete(ctx, path, isDir)
+		if err != nil && !webdav.IsNotFound(err) {
+			a.async(func() {
+				a.deleting = false
+				a.addLog("删除失败：%s：%v", display, err)
+				a.status = "删除失败"
+			})
+			return
+		}
+		notFound := err != nil
+
+		cacheErr := a.cache.Delete(path)
+
+		a.async(func() {
+			a.deleting = false
+			if cacheErr != nil {
+				a.addLog("清理本地缓存失败：%v", cacheErr)
+			}
+			a.removeNode(n)
+			if notFound {
+				a.addLog("服务器上已不存在：%s（已从本地移除）", display)
+			} else {
+				a.addLog("已删除：%s", display)
+			}
+			a.status = "就绪"
+		})
+	}()
+}
+
+// removeNode 从树模型和文件列表中移除节点（主线程）。
+func (a *App) removeNode(n *Node) {
+	parent := n.parent
+	if parent == nil {
+		return
+	}
+	parent.removeChild(n)
+	a.outline.Open.Remove(n)
+
+	if a.selectedEntry == n {
+		a.selectedEntry = nil
+		a.fileSelected = -1
+	}
+
+	// 删掉的正是当前选中的目录：回到父目录。
+	if a.selected == n || a.lastSelected == n {
+		a.selected = parent
+		a.lastSelected = parent
+		a.pendingReveal = parent
+		a.fileShownDir = ""
+		a.fileSelected = -1
+		a.selectedEntry = nil
+	}
+
+	// 列表里的行号会变，清掉选择避免指向别的条目。
+	if a.fileSelected >= 0 && a.selected == parent {
+		a.fileSelected = -1
+	}
 }
 
 // reconcile 在构建界面前调用：展开但尚未加载的目录，先读本地缓存，

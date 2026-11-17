@@ -293,6 +293,37 @@ func (c *Client) List(ctx context.Context, dir string) ([]store.Entry, error) {
 	return c.parseEntries(dir, data)
 }
 
+// Delete 删除文件或目录。目录会递归删除（Depth: infinity）。
+func (c *Client) Delete(ctx context.Context, p string, isDir bool) error {
+	if !c.Configured() {
+		return ErrNotConfigured
+	}
+
+	p = store.NormalizePath(p)
+	target, err := c.urlFor(p, isDir)
+	if err != nil {
+		return err
+	}
+
+	depth := ""
+	if isDir {
+		depth = "infinity"
+	}
+
+	data, status, err := c.do(ctx, http.MethodDelete, target, nil, depth)
+	if err != nil {
+		return err
+	}
+
+	switch status {
+	case http.StatusOK, http.StatusAccepted, http.StatusNoContent:
+		return nil
+	case http.StatusNotFound:
+		return &HTTPError{Status: status}
+	}
+	return &HTTPError{Status: status, Body: snippet(data)}
+}
+
 // Stat 返回单个资源的信息（PROPFIND Depth 0）。
 func (c *Client) Stat(ctx context.Context, p string) (store.Entry, error) {
 	if !c.Configured() {

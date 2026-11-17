@@ -334,3 +334,70 @@ func entryNames(entries []store.Entry) []string {
 	}
 	return out
 }
+
+// TestDelete 验证 DELETE 请求：目录带 Depth: infinity，文件不带 Depth。
+func TestDelete(t *testing.T) {
+	var (
+		mu      sync.Mutex
+		methods []string
+		depths  []string
+		paths   []string
+		auths   []string
+	)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		methods = append(methods, r.Method)
+		depths = append(depths, r.Header.Get("Depth"))
+		paths = append(paths, r.URL.EscapedPath())
+		u, p, ok := r.BasicAuth()
+		if ok {
+			auths = append(auths, u+":"+p)
+		}
+		mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	c := New(Options{BaseURL: srv.URL + "/dav", Username: "u", Password: "p", QPS: 1000})
+	if err := c.Delete(context.Background(), "/电影", true); err != nil {
+		t.Fatalf("Delete dir: %v", err)
+	}
+	if err := c.Delete(context.Background(), "/a b.txt", false); err != nil {
+		t.Fatalf("Delete file: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(methods) != 2 || methods[0] != "DELETE" || methods[1] != "DELETE" {
+		t.Fatalf("methods = %v", methods)
+	}
+	if depths[0] != "infinity" || depths[1] != "" {
+		t.Fatalf("depths = %v", depths)
+	}
+	if paths[0] != "/dav/%E7%94%B5%E5%BD%B1/" || paths[1] != "/dav/a%20b.txt" {
+		t.Fatalf("paths = %v", paths)
+	}
+	if auths[0] != "u:p" {
+		t.Fatalf("auth = %v", auths)
+	}
+}
+
+func TestDeleteNotFoundAndAuth(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/dav/gone.txt" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	c := New(Options{BaseURL: srv.URL + "/dav", QPS: 1000})
+	if err := c.Delete(context.Background(), "/gone.txt", false); !IsNotFound(err) {
+		t.Fatalf("err = %v, want not found", err)
+	}
+	if err := c.Delete(context.Background(), "/secret.txt", false); !IsAuthError(err) {
+		t.Fatalf("err = %v, want auth error", err)
+	}
+}

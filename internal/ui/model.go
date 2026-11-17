@@ -118,16 +118,32 @@ func (n *Node) mergeChildren(entries []store.Entry) {
 		})
 	}
 	n.children = next
+	n.rebuildLists()
+}
 
+// rebuildLists 重新计算 dirs / files 两个切片。
+func (n *Node) rebuildLists() {
 	n.dirs = n.dirs[:0]
 	n.files = n.files[:0]
-	for _, c := range next {
+	for _, c := range n.children {
 		if c.IsDir() {
 			n.dirs = append(n.dirs, c)
 		} else {
 			n.files = append(n.files, c)
 		}
 	}
+}
+
+// removeChild 从父节点移除指定子节点并更新 dirs / files。
+func (n *Node) removeChild(child *Node) bool {
+	for i, c := range n.children {
+		if c == child {
+			n.children = append(n.children[:i], n.children[i+1:]...)
+			n.rebuildLists()
+			return true
+		}
+	}
+	return false
 }
 
 // find 从当前节点开始按路径查找子节点。
