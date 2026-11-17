@@ -28,6 +28,7 @@ type Entry struct {
 	IsDir       bool
 	Size        int64
 	ETag        string
+	Created     time.Time
 	Modified    time.Time
 	ContentType string
 }
@@ -45,6 +46,7 @@ CREATE TABLE IF NOT EXISTS entry (
 	is_dir       INTEGER NOT NULL,
 	size         INTEGER NOT NULL,
 	etag         TEXT NOT NULL DEFAULT '',
+	created      INTEGER NOT NULL DEFAULT 0,
 	modified     INTEGER NOT NULL DEFAULT 0,
 	content_type TEXT NOT NULL DEFAULT '',
 	PRIMARY KEY (parent, name)
@@ -88,6 +90,12 @@ func Open(path string) (*Cache, error) {
 		return nil, fmt.Errorf("初始化数据库失败: %w", err)
 	}
 
+	// 老版本数据库没有 entry.created 列，这里做一次轻量迁移。
+	if err := ensureColumn(db, "entry", "created", "created INTEGER NOT NULL DEFAULT 0"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("升级数据库结构失败: %w", err)
+	}
+
 	// 老版本用的是 WAL 模式：这里兜底切回 DELETE，并清理可能残留的 -wal / -shm。
 	if err := ensureDeleteJournal(db); err != nil {
 		db.Close()
@@ -96,6 +104,42 @@ func Open(path string) (*Cache, error) {
 	cleanupSidecarFiles(path)
 
 	return &Cache{db: db, path: path}, nil
+}
+
+// ensureColumn 检查表中是否存在某列，不存在则加上（用于老数据库迁移）。
+func ensureColumn(db *sql.DB, table, column, ddl string) error {
+	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	found := false
+	for rows.Next() {
+		var (
+			cid       int
+			name      string
+			ctype     string
+			notNull   int
+			dfltValue any
+			pk        int
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notNull, &dfltValue, &pk); err != nil {
+			return err
+		}
+		if name == column {
+			found = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if found {
+		return nil
+	}
+
+	_, err = db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + ddl)
+	return err
 }
 
 // ensureDeleteJournal 确保数据库使用 DELETE 日志模式。
@@ -158,7 +202,7 @@ func (c *Cache) Children(parent string) ([]Entry, bool) {
 	}
 
 	rows, err := c.db.Query(`
-		SELECT name, is_dir, size, etag, modified, content_type
+		SELECT name, is_dir, size, etag, created, modified, content_type
 		FROM entry
 		WHERE parent = ?
 		ORDER BY is_dir DESC, sort_name ASC, name ASC`, parent)
@@ -170,14 +214,17 @@ func (c *Cache) Children(parent string) ([]Entry, bool) {
 	entries := make([]Entry, 0, 16)
 	for rows.Next() {
 		var (
-			e        Entry
-			isDir    int
-			modified int64
+			e                 Entry
+			isDir             int
+			created, modified int64
 		)
-		if err := rows.Scan(&e.Name, &isDir, &e.Size, &e.ETag, &modified, &e.ContentType); err != nil {
+		if err := rows.Scan(&e.Name, &isDir, &e.Size, &e.ETag, &created, &modified, &e.ContentType); err != nil {
 			return nil, false
 		}
 		e.IsDir = isDir != 0
+		if created > 0 {
+			e.Created = time.Unix(0, created)
+		}
 		if modified > 0 {
 			e.Modified = time.Unix(0, modified)
 		}
@@ -245,20 +292,23 @@ func (c *Cache) SetFolder(parent string, entries []Entry) error {
 		return err
 	}
 
-	stmt, err := tx.Prepare(`INSERT INTO entry(parent, name, sort_name, is_dir, size, etag, modified, content_type)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?)`)
+	stmt, err := tx.Prepare(`INSERT INTO entry(parent, name, sort_name, is_dir, size, etag, created, modified, content_type)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		return err
 	}
 	defer stmt.Close()
 
 	for _, e := range list {
-		var modified int64
+		var created, modified int64
+		if !e.Created.IsZero() {
+			created = e.Created.UnixNano()
+		}
 		if !e.Modified.IsZero() {
 			modified = e.Modified.UnixNano()
 		}
 		if _, err := stmt.Exec(parent, e.Name, strings.ToLower(e.Name),
-			boolInt(e.IsDir), e.Size, e.ETag, modified, e.ContentType); err != nil {
+			boolInt(e.IsDir), e.Size, e.ETag, created, modified, e.ContentType); err != nil {
 			return err
 		}
 	}
@@ -374,7 +424,7 @@ func (c *Cache) Search(query string, limit int) ([]SearchHit, error) {
 	}
 
 	// 多取一些候选，再在 Go 里按相关度排序、截断。
-	q := `SELECT parent, name, is_dir, size, etag, modified, content_type
+	q := `SELECT parent, name, is_dir, size, etag, created, modified, content_type
 		FROM entry
 		WHERE ` + strings.Join(conds, " AND ") + `
 		ORDER BY sort_name ASC, parent ASC
@@ -390,14 +440,17 @@ func (c *Cache) Search(query string, limit int) ([]SearchHit, error) {
 	hits := make([]SearchHit, 0, limit)
 	for rows.Next() {
 		var (
-			h        SearchHit
-			isDir    int
-			modified int64
+			h                 SearchHit
+			isDir             int
+			created, modified int64
 		)
-		if err := rows.Scan(&h.Parent, &h.Name, &isDir, &h.Size, &h.ETag, &modified, &h.ContentType); err != nil {
+		if err := rows.Scan(&h.Parent, &h.Name, &isDir, &h.Size, &h.ETag, &created, &modified, &h.ContentType); err != nil {
 			return nil, err
 		}
 		h.IsDir = isDir != 0
+		if created > 0 {
+			h.Created = time.Unix(0, created)
+		}
 		if modified > 0 {
 			h.Modified = time.Unix(0, modified)
 		}

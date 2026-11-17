@@ -336,6 +336,7 @@ const propfindBody = `<?xml version="1.0" encoding="utf-8"?>
     <d:getcontentlength/>
     <d:getetag/>
     <d:getlastmodified/>
+    <d:creationdate/>
     <d:getcontenttype/>
   </d:prop>
 </d:propfind>`
@@ -579,6 +580,7 @@ type davProp struct {
 	ContentLength string          `xml:"getcontentlength"`
 	ETag          string          `xml:"getetag"`
 	LastModified  string          `xml:"getlastmodified"`
+	CreationDate  string          `xml:"creationdate"`
 	ContentType   string          `xml:"getcontenttype"`
 	ResourceType  davResourceType `xml:"resourcetype"`
 }
@@ -630,6 +632,7 @@ func (c *Client) parseEntries(dir string, data []byte) ([]store.Entry, error) {
 			ETag:        strings.Trim(strings.TrimSpace(prop.ETag), `"`),
 			ContentType: strings.TrimSpace(prop.ContentType),
 			Modified:    parseHTTPTime(prop.LastModified),
+			Created:     parseHTTPTime(prop.CreationDate),
 		}
 		if n, err := strconv.ParseInt(strings.TrimSpace(prop.ContentLength), 10, 64); err == nil && n > 0 {
 			e.Size = n
@@ -650,8 +653,9 @@ func parseHTTPTime(v string) time.Time {
 		return t
 	}
 	layouts := []string{
+		time.RFC3339Nano,
 		time.RFC3339,
-		"2006-01-02T15:04:05Z07:00",
+		"2006-01-02T15:04:05",
 		"2006-01-02 15:04:05",
 	}
 	for _, l := range layouts {

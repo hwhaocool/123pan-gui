@@ -45,13 +45,14 @@ type App struct {
 	logList    ui.ListState
 	topPercent float32 // 上方面板（目录树 + 文件列表）占高度百分比
 
-	leftWidth    float32
-	fileList     ui.ListState
-	fileSelected int
-	selectedFile *Node
-	fileShownDir string
-	pendingFile  string
-	lastSelected *Node
+	leftWidth     float32
+	fileList      ui.ListState
+	fileSelected  int
+	selectedEntry *Node
+	fileShownDir  string
+	pendingFile   string
+	lastSelected  *Node
+	crumbIndex    int
 
 	searchQuery    string
 	searchResults  []store.SearchHit
@@ -270,12 +271,7 @@ func (a *App) treeView(c *ui.Context, t *ui.Theme) {
 	ui.Outline(c, &a.outline, []*Node{a.root}, func(n *Node) []*Node {
 		return n.outlineChildren()
 	}, func(n *Node) {
-		icon := ui.Box(c).Size(14, 14).Radius(3).Shrink(0)
-		if n.IsDir() {
-			icon.Background(t.Accent.Alpha(0.22))
-		} else {
-			icon.Background(t.TextMuted.Alpha(0.18))
-		}
+		ui.Icon(c, iconFolder).Size(16, 16).TextColor(t.Accent)
 		ui.Text(c, n.Name()).SingleLine()
 		if n.loading {
 			ui.Spinner(c)
@@ -294,7 +290,7 @@ func (a *App) treeView(c *ui.Context, t *ui.Theme) {
 		a.lastSelected = a.selected
 		a.fileList = ui.ListState{}
 		a.fileSelected = -1
-		a.selectedFile = nil
+		a.selectedEntry = nil
 		if a.selected != nil && a.selected.IsDir() &&
 			!a.selected.loaded && !a.selected.loading && !a.selected.loadFailed {
 			a.loadNode(a.selected)
@@ -316,15 +312,15 @@ func (a *App) filesView(c *ui.Context, t *ui.Theme) {
 	if a.fileShownDir != dir.Path() {
 		a.fileShownDir = dir.Path()
 		a.fileSelected = -1
-		a.selectedFile = nil
+		a.selectedEntry = nil
 	}
 
-	files := dir.Files()
+	entries := dir.Children()
 
 	revealIndex := -1
 	if a.pendingFile != "" {
-		for i, f := range files {
-			if f.Path() == a.pendingFile {
+		for i, e := range entries {
+			if e.Path() == a.pendingFile {
 				revealIndex = i
 				a.fileSelected = i
 				break
@@ -335,50 +331,103 @@ func (a *App) filesView(c *ui.Context, t *ui.Theme) {
 		}
 	}
 
+	names, nodes := a.breadcrumb(dir)
+
 	ui.Column(c).Fill().Background(t.Background).Children(func() {
 		ui.Row(c).Padding(10, 8).Gap(8).AlignItems(ui.Center).Children(func() {
-			ui.Text(c, "文件").Bold()
-			ui.Text(c, dir.DisplayPath()).TextColor(t.TextMuted).SingleLine()
-			ui.Spacer(c)
+			a.crumbIndex = len(names) - 1
+			if ui.Breadcrumbs(c, names, &a.crumbIndex).Label("路径").Grow(1).Changed() {
+				if a.crumbIndex >= 0 && a.crumbIndex < len(nodes) {
+					a.navigateTo(nodes[a.crumbIndex])
+				}
+			}
 			if dir.loading {
 				ui.Spinner(c)
 			}
-			ui.Text(c, fmt.Sprintf("%d 个文件", len(files))).TextColor(t.TextMuted)
+			ui.Text(c, fmt.Sprintf("%d 个文件夹 / %d 个文件", len(dir.dirs), len(dir.files))).
+				TextColor(t.TextMuted).SingleLine()
 		})
 
 		a.fileList.Selected = &a.fileSelected
-		a.fileList.Key = func(i int) any { return files[i].Path() }
+		a.fileList.Key = func(i int) any { return entries[i].Path() }
 		cols := []ui.TableColumn{
 			{Title: "名称"},
-			{Title: "大小", Width: 110, Align: ui.End},
-			{Title: "修改时间", Width: 170},
-			{Title: "ETag", Width: 140},
+			{Title: "大小", Width: 100, Align: ui.End},
+			{Title: "创建时间", Width: 165},
+			{Title: "修改时间", Width: 165},
 		}
-		ui.Table(c, &a.fileList, cols, len(files), func(row, col int) {
-			e := files[row].Entry()
+		if ui.Table(c, &a.fileList, cols, len(entries), func(row, col int) {
+			e := entries[row].Entry()
 			switch col {
 			case 0:
+				if e.IsDir {
+					ui.Icon(c, iconFolder).Size(16, 16).TextColor(t.Accent)
+				} else {
+					ui.Icon(c, iconFile).Size(16, 16).TextColor(t.TextMuted)
+				}
 				ui.Text(c, e.Name).SingleLine()
 			case 1:
-				ui.Text(c, FormatSize(e.Size))
+				if e.IsDir {
+					ui.Text(c, "-").TextColor(t.TextMuted)
+				} else {
+					ui.Text(c, FormatSize(e.Size))
+				}
 			case 2:
-				ui.Text(c, formatTime(e.Modified))
+				ui.Text(c, formatTime(e.Created)).TextColor(t.TextMuted)
 			case 3:
-				ui.Text(c, e.ETag).TextColor(t.TextMuted).SingleLine()
+				ui.Text(c, formatTime(e.Modified)).TextColor(t.TextMuted)
 			}
-		}).Grow(1).Label("文件列表")
+		}).Grow(1).Label("文件列表").Submitted() {
+			if a.fileSelected >= 0 && a.fileSelected < len(entries) && entries[a.fileSelected].IsDir() {
+				a.navigateTo(entries[a.fileSelected])
+			}
+		}
 	})
 
-	if a.fileSelected >= 0 && a.fileSelected < len(files) {
-		a.selectedFile = files[a.fileSelected]
+	if a.fileSelected >= 0 && a.fileSelected < len(entries) {
+		a.selectedEntry = entries[a.fileSelected]
 	} else {
-		a.selectedFile = nil
+		a.selectedEntry = nil
 	}
 
 	if revealIndex >= 0 {
 		a.fileList.ScrollTo(revealIndex, ui.Center)
 		a.pendingFile = ""
 		c.Invalidate()
+	}
+}
+
+// breadcrumb 返回从根到 dir 的路径名与对应节点。
+func (a *App) breadcrumb(dir *Node) (names []string, nodes []*Node) {
+	for n := dir; n != nil; n = n.parent {
+		names = append(names, n.Name())
+		nodes = append(nodes, n)
+	}
+	for i, j := 0, len(nodes)-1; i < j; i, j = i+1, j-1 {
+		names[i], names[j] = names[j], names[i]
+		nodes[i], nodes[j] = nodes[j], nodes[i]
+	}
+	return names, nodes
+}
+
+// navigateTo 跳转到某个目录：展开祖先、选中该节点，并刷新右侧列表。
+func (a *App) navigateTo(n *Node) {
+	if n == nil || !n.IsDir() {
+		return
+	}
+	for p := n; p != nil; p = p.parent {
+		a.outline.Open.Add(p)
+	}
+	a.showResults = false
+	a.pendingReveal = n
+	a.pendingFile = ""
+	a.fileShownDir = ""
+	a.fileSelected = -1
+	a.selectedEntry = nil
+	a.selected = n
+	a.lastSelected = n
+	if !n.loaded && !n.loading && !n.loadFailed {
+		a.loadNode(n)
 	}
 }
 
@@ -465,34 +514,25 @@ func (a *App) alert(c *ui.Context) {
 //
 
 func (a *App) infoText() string {
-	if f := a.selectedFile; f != nil {
-		e := f.Entry()
-		etag := e.ETag
-		if etag == "" {
-			etag = "-"
-		}
-		return fmt.Sprintf("文件：%s　|　%s　|　修改于 %s　|　ETag %s",
-			f.DisplayPath(), FormatSize(e.Size), formatTime(e.Modified), etag)
+	if sel := a.selectedEntry; sel != nil {
+		return describeNode(sel)
 	}
-
-	n := a.selected
-	if n == nil {
-		if a.info != "" {
-			return a.info
-		}
-		return "就绪"
+	if n := a.selected; n != nil {
+		return describeNode(n)
 	}
+	if a.info != "" {
+		return a.info
+	}
+	return "就绪"
+}
 
+func describeNode(n *Node) string {
 	if n.IsDir() {
 		if n.Loaded() {
-			synced := "已加载"
-			if at, ok := a.cache.SyncedAt(n.Path()); ok {
-				synced = formatTime(at)
-			}
-			return fmt.Sprintf("目录：%s　|　%d 个子目录 / %d 个文件　|　同步于 %s",
-				n.DisplayPath(), len(n.dirs), len(n.files), synced)
+			return fmt.Sprintf("目录：%s　|　%d 个子目录 / %d 个文件　|　已加载",
+				n.DisplayPath(), len(n.dirs), len(n.files))
 		}
-		return fmt.Sprintf("目录：%s　|　子项未加载（展开或点击「同步选中目录」）", n.DisplayPath())
+		return fmt.Sprintf("目录：%s　|　子项未加载（双击进入或展开）", n.DisplayPath())
 	}
 
 	e := n.Entry()
@@ -500,8 +540,8 @@ func (a *App) infoText() string {
 	if etag == "" {
 		etag = "-"
 	}
-	return fmt.Sprintf("文件：%s　|　%s　|　修改于 %s　|　ETag %s",
-		n.DisplayPath(), FormatSize(e.Size), formatTime(e.Modified), etag)
+	return fmt.Sprintf("文件：%s　|　%s　|　创建于 %s　|　修改于 %s　|　ETag %s",
+		n.DisplayPath(), FormatSize(e.Size), formatTime(e.Created), formatTime(e.Modified), etag)
 }
 
 func (a *App) syncSelected() {
@@ -675,6 +715,7 @@ func (a *App) scrollToPendingReveal(c *ui.Context) {
 		if a.outline.Item(i) == a.pendingReveal {
 			a.selectedRow = i
 			a.selected = a.pendingReveal
+			a.lastSelected = a.pendingReveal
 			a.outline.List.ScrollTo(i, ui.Center)
 			a.pendingReveal = nil
 			c.Invalidate()

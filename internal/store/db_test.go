@@ -23,8 +23,9 @@ func TestSetFolderSortsAndRoundTrips(t *testing.T) {
 	}
 
 	modified := time.Date(2025, 3, 1, 12, 0, 0, 0, time.UTC)
+	created := time.Date(2024, 12, 31, 8, 30, 0, 0, time.UTC)
 	err = c.SetFolder("/", []Entry{
-		{Name: "meta.txt", Size: 10, ETag: "e1", Modified: modified, ContentType: "text/plain"},
+		{Name: "meta.txt", Size: 10, ETag: "e1", Created: created, Modified: modified, ContentType: "text/plain"},
 		{Name: "A-Folder", IsDir: true},
 		{Name: "a.txt", Size: 5},
 		{Name: "z-folder", IsDir: true},
@@ -60,6 +61,9 @@ func TestSetFolderSortsAndRoundTrips(t *testing.T) {
 	}
 	if !meta.Modified.Equal(modified) {
 		t.Fatalf("modified = %s, want %s", meta.Modified, modified)
+	}
+	if !meta.Created.Equal(created) {
+		t.Fatalf("created = %s, want %s", meta.Created, created)
 	}
 
 	if folders, items := c.Stats(); folders != 1 || items != 5 {
@@ -383,5 +387,65 @@ func TestMigratesFromWAL(t *testing.T) {
 	}
 	if _, err := os.Stat(path + "-shm"); !os.IsNotExist(err) {
 		t.Fatalf("shm file left behind (err=%v)", err)
+	}
+}
+
+// TestMigratesMissingCreatedColumn 验证老数据库（没有 created 列）会自动加列且数据不丢。
+func TestMigratesMissingCreatedColumn(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "tree.db")
+
+	raw, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path))
+	if err != nil {
+		t.Fatalf("open raw: %v", err)
+	}
+	legacy := `
+CREATE TABLE folder (path TEXT PRIMARY KEY, synced_at INTEGER NOT NULL);
+CREATE TABLE entry (
+	parent TEXT NOT NULL, name TEXT NOT NULL, sort_name TEXT NOT NULL,
+	is_dir INTEGER NOT NULL, size INTEGER NOT NULL,
+	etag TEXT NOT NULL DEFAULT '', modified INTEGER NOT NULL DEFAULT 0,
+	content_type TEXT NOT NULL DEFAULT '',
+	PRIMARY KEY (parent, name)
+);`
+	if _, err := raw.Exec(legacy); err != nil {
+		t.Fatalf("legacy schema: %v", err)
+	}
+	modified := time.Date(2025, 1, 2, 3, 4, 5, 0, time.UTC).UnixNano()
+	if _, err := raw.Exec(`INSERT INTO folder(path, synced_at) VALUES('/', 1)`); err != nil {
+		t.Fatalf("insert folder: %v", err)
+	}
+	if _, err := raw.Exec(`INSERT INTO entry(parent, name, sort_name, is_dir, size, etag, modified, content_type)
+		VALUES('/', 'old.txt', 'old.txt', 0, 7, 'e', ?, 'text/plain')`, modified); err != nil {
+		t.Fatalf("insert entry: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw: %v", err)
+	}
+
+	c, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer c.Close()
+
+	entries, ok := c.Children("/")
+	if !ok || len(entries) != 1 {
+		t.Fatalf("entries = %v, ok=%v", entries, ok)
+	}
+	e := entries[0]
+	if e.Name != "old.txt" || e.Size != 7 || e.ETag != "e" {
+		t.Fatalf("entry = %+v", e)
+	}
+	if !e.Modified.Equal(time.Unix(0, modified)) {
+		t.Fatalf("modified = %s", e.Modified)
+	}
+	if !e.Created.IsZero() {
+		t.Fatalf("created = %s, want zero", e.Created)
+	}
+
+	// 新列可以正常写入。
+	if err := c.SetFolder("/", []Entry{{Name: "new.txt", Created: time.Now()}}); err != nil {
+		t.Fatalf("SetFolder after migration: %v", err)
 	}
 }

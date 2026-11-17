@@ -37,6 +37,7 @@ const listXML = `<?xml version="1.0" encoding="utf-8"?>
         <D:getetag>"abc123"</D:getetag>
         <D:getcontenttype>application/pdf</D:getcontenttype>
         <D:getlastmodified>Sat, 01 Mar 2025 08:30:00 GMT</D:getlastmodified>
+        <D:creationdate>2024-12-31T08:30:00Z</D:creationdate>
       </D:prop>
       <D:status>HTTP/1.1 200 OK</D:status>
     </D:propstat>
@@ -120,6 +121,9 @@ func TestListParsesMultistatus(t *testing.T) {
 	}
 	if file.Modified.IsZero() || file.Modified.UTC().Format(time.RFC3339) != "2025-03-01T08:30:00Z" {
 		t.Fatalf("modified = %s", file.Modified)
+	}
+	if file.Created.IsZero() || file.Created.UTC().Format(time.RFC3339) != "2024-12-31T08:30:00Z" {
+		t.Fatalf("created = %s", file.Created)
 	}
 }
 
