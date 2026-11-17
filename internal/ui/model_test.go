@@ -1,9 +1,10 @@
 package ui
 
 import (
+	"strings"
 	"testing"
 
-	"pan123/internal/api"
+	"pan123/internal/store"
 )
 
 // TestPlaceholderForUnloadedFolder 验证「未加载的文件夹」会带一个占位子项，
@@ -13,11 +14,14 @@ func TestPlaceholderForUnloadedFolder(t *testing.T) {
 	if root.ChildCount() != 1 || !root.children[0].placeholder {
 		t.Fatalf("root should start with a placeholder child, got %#v", root.children)
 	}
+	if root.Path() != "/" {
+		t.Fatalf("root path = %q", root.Path())
+	}
 
 	model := NewTreeModel(root)
-	model.ApplyFolder(root, []api.FileInfo{
-		{FileID: 10, Filename: "dir", Type: 1},
-		{FileID: 11, Filename: "file.txt", Type: 0, Size: 3},
+	model.ApplyFolder(root, []store.Entry{
+		{Name: "dir", IsDir: true},
+		{Name: "file.txt", Size: 3},
 	})
 
 	if !root.Loaded() {
@@ -31,6 +35,9 @@ func TestPlaceholderForUnloadedFolder(t *testing.T) {
 	if !dir.IsDir() || dir.Loaded() {
 		t.Fatalf("dir = %#v", dir)
 	}
+	if dir.Path() != "/dir" {
+		t.Fatalf("dir path = %q", dir.Path())
+	}
 	if got := dir.ChildCount(); got != 1 || !dir.children[0].placeholder {
 		t.Fatalf("unloaded dir should have exactly one placeholder child, got %d", got)
 	}
@@ -39,20 +46,24 @@ func TestPlaceholderForUnloadedFolder(t *testing.T) {
 	}
 
 	file := root.children[1]
-	if file.IsDir() {
-		t.Fatalf("second child should be a file")
+	if file.IsDir() || file.Path() != "/file.txt" {
+		t.Fatalf("file = %#v path=%q", file, file.Path())
 	}
 	if file.ChildCount() != 0 || file.HasChild() {
 		t.Fatal("file should have no children and no expander")
 	}
+	if txt := file.Text(); !strings.Contains(txt, "3 B") {
+		t.Fatalf("file text = %q", txt)
+	}
 
 	// 同步该目录后：占位子项被真实子项替换。
-	model.ApplyFolder(dir, []api.FileInfo{{FileID: 12, Filename: "inner.txt", Type: 0, Size: 1}})
+	model.ApplyFolder(dir, []store.Entry{{Name: "inner.txt", Size: 1}})
 	if !dir.Loaded() || dir.ChildCount() != 1 {
 		t.Fatalf("dir after apply: loaded=%v children=%d", dir.Loaded(), dir.ChildCount())
 	}
-	if dir.children[0].placeholder || dir.children[0].FileID() != 12 {
-		t.Fatalf("placeholder was not replaced: %#v", dir.children[0])
+	inner := dir.children[0]
+	if inner.placeholder || inner.Path() != "/dir/inner.txt" {
+		t.Fatalf("inner = %#v", inner)
 	}
 
 	// 空的已加载目录不应再显示展开箭头。
@@ -62,36 +73,54 @@ func TestPlaceholderForUnloadedFolder(t *testing.T) {
 	}
 }
 
-// TestPlaceholderKeptWhenSyncFails 验证同步失败（未 apply）时占位子项仍在。
-func TestPlaceholderKept(t *testing.T) {
+// TestApplyFolderKeepsNodes 验证按名称复用节点指针（walk 的 item↔handle 映射依赖它）。
+func TestApplyFolderKeepsNodes(t *testing.T) {
 	root := NewRootNode()
 	model := NewTreeModel(root)
-	model.ApplyFolder(root, []api.FileInfo{{FileID: 10, Filename: "dir", Type: 1}})
 
-	dir := root.children[0]
-	if !dir.children[0].placeholder {
-		t.Fatal("expected placeholder")
+	model.ApplyFolder(root, []store.Entry{
+		{Name: "keep", IsDir: true},
+		{Name: "remove", IsDir: true},
+	})
+	keep := root.children[0]
+	remove := root.children[1]
+	if keep.entry.Name != "keep" || remove.entry.Name != "remove" {
+		t.Fatalf("children = %v", []string{keep.entry.Name, remove.entry.Name})
 	}
-	// 模拟再次展开、仍然没同步成功：占位子项不会被清掉。
-	dir.ensurePlaceholder()
-	if dir.ChildCount() != 1 || !dir.children[0].placeholder {
-		t.Fatalf("children = %#v", dir.children)
+
+	model.ApplyFolder(root, []store.Entry{
+		{Name: "keep", IsDir: true, ETag: "new-etag"},
+		{Name: "added", Size: 10},
+	})
+
+	if len(root.children) != 2 {
+		t.Fatalf("children = %d", len(root.children))
+	}
+	keptNode := root.children[0]
+	if keptNode != keep {
+		t.Fatal("existing node pointer should be reused")
+	}
+	if keptNode.Entry().ETag != "new-etag" {
+		t.Fatalf("entry not updated: %+v", keptNode.Entry())
+	}
+	if root.children[1].Entry().Name != "added" {
+		t.Fatalf("added child = %+v", root.children[1].Entry())
 	}
 }
 
-// TestNodePath 验证路径拼接使用原始文件名（不包含大小等展示后缀）。
-func TestNodePath(t *testing.T) {
+// TestDisplayPath 验证日志用的展示路径。
+func TestDisplayPath(t *testing.T) {
 	root := NewRootNode()
 	model := NewTreeModel(root)
-	model.ApplyFolder(root, []api.FileInfo{{FileID: 10, Filename: "dir", Type: 1}})
+	model.ApplyFolder(root, []store.Entry{{Name: "dir", IsDir: true}})
 	dir := root.children[0]
-	model.ApplyFolder(dir, []api.FileInfo{{FileID: 11, Filename: "a.bin", Type: 0, Size: 2048}})
+	model.ApplyFolder(dir, []store.Entry{{Name: "a.bin", Size: 2048}})
 
 	file := dir.children[0]
-	if got := file.Path(); got != "我的云盘/dir/a.bin" {
-		t.Fatalf("path = %q", got)
+	if got := file.DisplayPath(); got != "我的云盘/dir/a.bin" {
+		t.Fatalf("display path = %q", got)
 	}
-	if got := dir.Path(); got != "我的云盘/dir" {
-		t.Fatalf("dir path = %q", got)
+	if got := file.Path(); got != "/dir/a.bin" {
+		t.Fatalf("webdav path = %q", got)
 	}
 }

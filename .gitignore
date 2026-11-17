@@ -2,11 +2,16 @@
 *.exe
 rsrc.syso
 
-# 本地配置（含 access_token / clientID / clientSecret，切勿提交）
+# 本地配置（含 WebDAV 用户名/密码，切勿提交）
 /config.json
-/tree.json
-/tree.json.bad
 config.json.tmp
+
+# 本地 SQLite 缓存
+/tree.db
+/tree.db-wal
+/tree.db-shm
+/tree.db.bad
+/tree.db-journal
 
 # 本地运行日志
 run.log

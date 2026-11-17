@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"pan123/internal/api"
 	"pan123/internal/store"
+	"pan123/internal/webdav"
 )
 
 // Job 是一次同步请求。
@@ -20,14 +20,14 @@ type Job struct {
 }
 
 // Syncer 用单个 goroutine 串行执行同步任务。
-// 所有网络请求都经过 api.Client 内部的限速器，因此多任务排队也不会突破 QPS 限制。
+// 所有请求都经过 webdav.Client 内部的限速器，因此多任务排队也不会突破 QPS 限制。
 type Syncer struct {
-	client *api.Client
+	client *webdav.Client
 	cache  *store.Cache
 
 	// 由 App 注入。
 	synchronize func(func())                     // 投递到 UI 线程（异步）
-	apply       func(*Node, []api.FileInfo)      // 在 UI 线程更新树模型
+	apply       func(*Node, []store.Entry)       // 在 UI 线程更新树模型
 	logf        func(format string, args ...any) // 写日志
 	status      func(string)                     // 更新状态栏
 	busy        func(bool)                       // 更新按钮可用状态
@@ -43,14 +43,13 @@ type Syncer struct {
 }
 
 // NewSyncer 创建同步器。
-func NewSyncer(client *api.Client, cache *store.Cache) *Syncer {
-	s := &Syncer{
+func NewSyncer(client *webdav.Client, cache *store.Cache) *Syncer {
+	return &Syncer{
 		client: client,
 		cache:  cache,
 		signal: make(chan struct{}, 1),
 		quit:   make(chan struct{}),
 	}
-	return s
 }
 
 // Start 启动后台 worker。
@@ -185,15 +184,17 @@ func (s *Syncer) process(job *Job) {
 		defer s.done(node)
 	}
 
-	s.logf("开始同步 %s（%s，QPS=%.1f，请求间隔≈%s）", node.Path(), onOff(recursive, "含子目录", "仅本层"), s.client.QPS(), s.client.Interval())
+	s.logf("开始同步 %s（%s，QPS=%.1f，请求间隔≈%s）",
+		node.DisplayPath(), onOff(recursive, "含子目录", "仅本层"), s.client.QPS(), s.client.Interval())
 	s.status("准备同步…")
 
 	stack := []*Node{node}
-	folders, items, total := 0, 0, 0
+	folders, items := 0, 0
 
 	for len(stack) > 0 {
 		if ctx.Err() != nil {
-			s.logf("已停止同步 %s（完成 %d 个目录 / %d 项，用时 %s）", node.Path(), folders, items, time.Since(start).Round(time.Second))
+			s.logf("已停止同步 %s（完成 %d 个目录 / %d 项，用时 %s）",
+				node.DisplayPath(), folders, items, time.Since(start).Round(time.Second))
 			s.status("已停止")
 			return
 		}
@@ -204,37 +205,40 @@ func (s *Syncer) process(job *Job) {
 			continue
 		}
 
-		s.status(fmt.Sprintf("同步中：%s", cur.Path()))
-		files, err := s.client.ListAll(ctx, cur.FileID())
+		s.status(fmt.Sprintf("同步中：%s", cur.DisplayPath()))
+		entries, err := s.client.List(ctx, cur.Path())
 		if err != nil {
 			if ctx.Err() != nil {
-				s.logf("已停止同步 %s（完成 %d 个目录 / %d 项）", node.Path(), folders, items)
+				s.logf("已停止同步 %s（完成 %d 个目录 / %d 项）", node.DisplayPath(), folders, items)
 				s.status("已停止")
 				return
 			}
-			s.logf("同步失败：%s：%v", cur.Path(), err)
-			if errors.Is(err, api.ErrNotConfigured) || api.IsAuthError(err) {
+			s.logf("同步失败：%s：%v", cur.DisplayPath(), err)
+			if errors.Is(err, webdav.ErrNotConfigured) || webdav.IsAuthError(err) {
 				s.status("同步失败")
-				s.saveCache()
+				s.flush()
 				return
 			}
 			// 单个目录失败（例如刚被删除）不影响其它目录继续同步。
 			continue
 		}
 
-		skipped := s.cache.SetFolder(cur.FileID(), files)
-		cached, _ := s.cache.Children(cur.FileID())
+		if err := s.cache.SetFolder(cur.Path(), entries); err != nil {
+			s.logf("写入本地数据库失败：%s：%v", cur.DisplayPath(), err)
+			s.status("写入缓存失败")
+			return
+		}
 
+		cached, _ := s.cache.Children(cur.Path())
 		// 在 UI 线程同步更新模型，保证下面 ChildDirs() 读到的是最新数据。
 		s.callUI(func() { s.apply(cur, cached) })
 
 		folders++
-		total += len(files)
 		items += len(cached)
-		s.logf("  ✓ %s（%d 项%s）", cur.Path(), len(cached), trashedHint(skipped))
+		s.logf("  ✓ %s（%d 项）", cur.DisplayPath(), len(cached))
 
 		if folders%20 == 0 {
-			s.saveCache()
+			s.flush()
 		}
 
 		if recursive {
@@ -245,9 +249,10 @@ func (s *Syncer) process(job *Job) {
 		}
 	}
 
-	s.saveCache()
+	s.flush()
 	s.status(fmt.Sprintf("同步完成：%d 个目录 / %d 项", folders, items))
-	s.logf("同步完成：%s（请求 %d 个目录，共 %d 项，用时 %s）", node.Path(), folders, total, time.Since(start).Round(time.Second))
+	s.logf("同步完成：%s（请求 %d 个目录，共 %d 项，用时 %s）",
+		node.DisplayPath(), folders, items, time.Since(start).Round(time.Second))
 }
 
 func (s *Syncer) callUI(f func()) {
@@ -263,9 +268,9 @@ func (s *Syncer) callUI(f func()) {
 	<-done
 }
 
-func (s *Syncer) saveCache() {
-	if err := s.cache.Save(); err != nil {
-		s.logf("保存本地缓存失败：%v", err)
+func (s *Syncer) flush() {
+	if err := s.cache.Flush(); err != nil {
+		s.logf("合并本地数据库失败：%v", err)
 	}
 }
 
@@ -274,11 +279,4 @@ func onOff(b bool, yes, no string) string {
 		return yes
 	}
 	return no
-}
-
-func trashedHint(skipped int) string {
-	if skipped <= 0 {
-		return ""
-	}
-	return fmt.Sprintf("，忽略回收站 %d 项", skipped)
 }

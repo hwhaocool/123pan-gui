@@ -5,11 +5,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
-// TestConfigPathInWorkDir 验证 config.json 落在程序当前工作目录。
-func TestConfigPathInWorkDir(t *testing.T) {
+// TestPathsInWorkDir 验证 config.json / tree.db 都落在程序当前工作目录。
+func TestPathsInWorkDir(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
 
@@ -21,15 +20,18 @@ func TestConfigPathInWorkDir(t *testing.T) {
 		t.Fatalf("config file name = %q", filepath.Base(path))
 	}
 	if !strings.EqualFold(filepath.Clean(path), filepath.Clean(filepath.Join(dir, ConfigFileName))) {
-		t.Fatalf("config path = %q, want it under %q", path, dir)
+		t.Fatalf("config path = %q, want under %q", path, dir)
 	}
 
 	cachePath, err := CachePath()
 	if err != nil {
 		t.Fatalf("CachePath: %v", err)
 	}
+	if filepath.Base(cachePath) != CacheFileName || filepath.Ext(cachePath) != ".db" {
+		t.Fatalf("cache file name = %q", filepath.Base(cachePath))
+	}
 	if !strings.EqualFold(filepath.Clean(cachePath), filepath.Clean(filepath.Join(dir, CacheFileName))) {
-		t.Fatalf("cache path = %q, want it under %q", cachePath, dir)
+		t.Fatalf("cache path = %q, want under %q", cachePath, dir)
 	}
 }
 
@@ -41,19 +43,18 @@ func TestLoadDefaultsAndRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.QPS != DefaultQPS || cfg.PageSize != DefaultPageSize || cfg.BaseURL != DefaultBaseURL {
+	if cfg.QPS != DefaultQPS || cfg.WebDAVURL != "" {
 		t.Fatalf("defaults = %+v", cfg)
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("config file should not exist yet: %v", err)
 	}
 
-	cfg.ClientID = "cid"
-	cfg.ClientSecret = "secret"
-	cfg.AccessToken = "tok"
-	cfg.TokenExpiredAt = time.Now().Add(time.Hour).Truncate(time.Second)
-	cfg.QPS = 2.5
-	cfg.PageSize = 50
+	cfg.WebDAVURL = "https://dav.example.com/dav/123pan"
+	cfg.Username = "user"
+	cfg.Password = "p@ss"
+	cfg.InsecureTLS = true
+	cfg.QPS = 8
 	if err := cfg.Save(path); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
@@ -65,28 +66,37 @@ func TestLoadDefaultsAndRoundTrip(t *testing.T) {
 	if loadedPath != path {
 		t.Fatalf("path = %q, want %q", loadedPath, path)
 	}
-	if loaded.ClientID != "cid" || loaded.ClientSecret != "secret" || loaded.AccessToken != "tok" {
+	if loaded.WebDAVURL != cfg.WebDAVURL || loaded.Username != "user" || loaded.Password != "p@ss" {
 		t.Fatalf("credentials = %+v", loaded)
 	}
-	if !loaded.TokenExpiredAt.Equal(cfg.TokenExpiredAt) {
-		t.Fatalf("expiredAt = %s, want %s", loaded.TokenExpiredAt, cfg.TokenExpiredAt)
-	}
-	if loaded.QPS != 2.5 || loaded.PageSize != 50 {
-		t.Fatalf("qps/pageSize = %v/%d", loaded.QPS, loaded.PageSize)
+	if !loaded.InsecureTLS || loaded.QPS != 8 {
+		t.Fatalf("loaded = %+v", loaded)
 	}
 }
 
-// TestSanitize 验证越界值被修正。
+// TestSanitize 验证越界值/URL 规范化。
 func TestSanitize(t *testing.T) {
-	c := &Config{QPS: 0, PageSize: 500, BaseURL: ""}
+	c := &Config{QPS: 0, WebDAVURL: "  dav.example.com/dav/123/  "}
 	c.Sanitize()
-	if c.QPS != DefaultQPS || c.PageSize != DefaultPageSize || c.BaseURL != DefaultBaseURL {
-		t.Fatalf("sanitized = %+v", c)
+	if c.QPS != DefaultQPS {
+		t.Fatalf("qps = %v", c.QPS)
+	}
+	if c.WebDAVURL != "https://dav.example.com/dav/123" {
+		t.Fatalf("url = %q", c.WebDAVURL)
 	}
 
-	c = &Config{QPS: 100, PageSize: -1, BaseURL: "http://x"}
+	c = &Config{QPS: 999, WebDAVURL: "http://192.168.1.10:8080/dav/"}
 	c.Sanitize()
-	if c.QPS != 20 || c.PageSize != DefaultPageSize || c.BaseURL != "http://x" {
-		t.Fatalf("sanitized = %+v", c)
+	if c.QPS != 50 {
+		t.Fatalf("qps = %v", c.QPS)
+	}
+	if c.WebDAVURL != "http://192.168.1.10:8080/dav" {
+		t.Fatalf("url = %q", c.WebDAVURL)
+	}
+
+	c = &Config{QPS: -1}
+	c.Sanitize()
+	if c.QPS != DefaultQPS {
+		t.Fatalf("qps = %v", c.QPS)
 	}
 }

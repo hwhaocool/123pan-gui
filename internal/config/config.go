@@ -1,6 +1,6 @@
 // Package config 负责配置文件与本地缓存目录。
 //
-// config.json 和 tree.json 都保存在「程序当前工作目录」（通常就是 exe 所在目录），
+// config.json 和 tree.db 都保存在「程序当前工作目录」（通常就是 exe 所在目录），
 // 整个程序目录可以直接拷贝带走，方便个人使用。
 package config
 
@@ -10,45 +10,37 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
 const (
-	// DefaultBaseURL 是 123 云盘开放平台地址。
-	DefaultBaseURL = "https://open-api.123pan.com"
-	// DefaultQPS 是默认限速（每秒请求数）。开放平台对单账号有 QPS 限制，保守取 1。
-	DefaultQPS = 1.0
-	// DefaultPageSize 是文件列表接口的每页条数上限（接口最大 100）。
-	DefaultPageSize = 100
+	// DefaultQPS 是默认限速（每秒请求数）。WebDAV 一般比开放平台宽松，保守取 5。
+	DefaultQPS = 5.0
 
 	// ConfigFileName / CacheFileName 是固定文件名。
 	ConfigFileName = "config.json"
-	CacheFileName  = "tree.json"
+	CacheFileName  = "tree.db"
 )
 
 // Config 是持久化到 config.json 的配置。
 type Config struct {
-	// AccessToken 是 openapi 访问凭证；可由 clientID/clientSecret 自动获取并回写到本地。
-	AccessToken    string    `json:"accessToken,omitempty"`
-	TokenExpiredAt time.Time `json:"tokenExpiredAt,omitzero"`
-	// ClientID/ClientSecret 用于自动换取 access_token。
-	ClientID     string `json:"clientId,omitempty"`
-	ClientSecret string `json:"clientSecret,omitempty"`
+	// WebDAVURL 是 WebDAV 根地址，例如 https://dav.example.com/dav/123pan
+	WebDAVURL string `json:"webdavUrl,omitempty"`
+	// Username / Password 用于 Basic Auth（留空表示匿名）。
+	Username string `json:"username,omitempty"`
+	Password string `json:"password,omitempty"`
+	// InsecureTLS 跳过 TLS 证书校验（自建/内网 WebDAV 常用）。
+	InsecureTLS bool `json:"insecureTls,omitempty"`
 
-	QPS      float64 `json:"qps"`
-	PageSize int     `json:"pageSize"`
-	BaseURL  string  `json:"baseUrl"`
+	QPS float64 `json:"qps"`
 
 	LastSyncAt time.Time `json:"lastSyncAt,omitzero"`
 }
 
 // Default 返回一份默认配置。
 func Default() *Config {
-	return &Config{
-		QPS:      DefaultQPS,
-		PageSize: DefaultPageSize,
-		BaseURL:  DefaultBaseURL,
-	}
+	return &Config{QPS: DefaultQPS}
 }
 
 // Sanitize 修正越界/空值。
@@ -56,18 +48,20 @@ func (c *Config) Sanitize() {
 	if c.QPS <= 0 {
 		c.QPS = DefaultQPS
 	}
-	if c.QPS > 20 {
-		c.QPS = 20
+	if c.QPS > 50 {
+		c.QPS = 50
 	}
-	if c.PageSize <= 0 || c.PageSize > 100 {
-		c.PageSize = DefaultPageSize
-	}
-	if c.BaseURL == "" {
-		c.BaseURL = DefaultBaseURL
+
+	c.WebDAVURL = strings.TrimSpace(c.WebDAVURL)
+	if c.WebDAVURL != "" {
+		if !strings.Contains(c.WebDAVURL, "://") {
+			c.WebDAVURL = "https://" + c.WebDAVURL
+		}
+		c.WebDAVURL = strings.TrimRight(c.WebDAVURL, "/")
 	}
 }
 
-// WorkDir 返回 config.json 所在目录：程序当前工作目录。
+// WorkDir 返回 config.json / tree.db 所在目录：程序当前工作目录。
 // 若工作目录不可用（例如被删除），回退到可执行文件所在目录。
 func WorkDir() (string, error) {
 	if wd, err := os.Getwd(); err == nil && wd != "" {
@@ -88,7 +82,7 @@ func ConfigPath() (string, error) {
 	return filepath.Join(d, ConfigFileName), nil
 }
 
-// CachePath 返回目录树缓存文件路径（当前工作目录下的 tree.json）。
+// CachePath 返回 SQLite 缓存文件路径（当前工作目录下的 tree.db）。
 func CachePath() (string, error) {
 	d, err := WorkDir()
 	if err != nil {

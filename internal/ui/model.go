@@ -2,10 +2,11 @@ package ui
 
 import (
 	"fmt"
+	"path"
 
 	"github.com/lxn/walk"
 
-	"pan123/internal/api"
+	"pan123/internal/store"
 )
 
 // Node 是树形控件中的一个节点。节点指针在整个生命周期内保持稳定，
@@ -13,19 +14,17 @@ import (
 // children 切片并在原节点上发布 ItemsReset。
 type Node struct {
 	parent      *Node
-	file        api.FileInfo
+	entry       store.Entry
+	path        string // 相对 WebDAV 根目录的绝对路径，根为 "/"
 	isRoot      bool
 	loaded      bool
 	placeholder bool
 	children    []*Node
 }
 
-// placeholderFileID 是占位子项的伪文件 ID。
-const placeholderFileID int64 = -1
-
-// NewRootNode 创建根节点（对应 FileID 0 的「我的云盘」）。
+// NewRootNode 创建根节点（对应 WebDAV 根目录 "/"）。
 func NewRootNode() *Node {
-	n := &Node{isRoot: true}
+	n := &Node{isRoot: true, path: "/"}
 	n.ensurePlaceholder()
 	return n
 }
@@ -38,14 +37,10 @@ func (n *Node) Text() string {
 	if n.placeholder {
 		return "（未同步：展开或点击「同步选中目录」）"
 	}
-	if n.file.IsDir() {
-		return n.file.Filename
+	if n.entry.IsDir {
+		return n.entry.Name
 	}
-	txt := fmt.Sprintf("%s   [%s]", n.file.Filename, FormatSize(n.file.Size))
-	if n.file.Status > 100 {
-		txt += "  [审核未通过]"
-	}
-	return txt
+	return fmt.Sprintf("%s   [%s]", n.entry.Name, FormatSize(n.entry.Size))
 }
 
 // Parent 实现 walk.TreeItem。
@@ -63,7 +58,7 @@ func (n *Node) ChildCount() int { return len(n.children) }
 func (n *Node) ChildAt(index int) walk.TreeItem { return n.children[index] }
 
 // HasChild 实现 walk.HasChilder。未加载过的文件夹返回 true，
-// 以便树控件显示展开箭头（展开时再从缓存/接口加载）。
+// 以便树控件显示展开箭头（展开时再从缓存/WebDAV 加载）。
 func (n *Node) HasChild() bool {
 	if !n.IsDir() {
 		return false
@@ -86,36 +81,34 @@ func (n *Node) ensurePlaceholder() {
 	}
 	n.children = []*Node{{
 		parent:      n,
+		path:        n.path,
 		placeholder: true,
-		file:        api.FileInfo{FileID: placeholderFileID, Filename: "（未同步）", Type: 0},
+		entry:       store.Entry{Name: "（未同步）"},
 	}}
 }
 
 // IsDir 表示节点是否文件夹。
-func (n *Node) IsDir() bool { return n.isRoot || n.file.IsDir() }
-
-// FileID 返回节点对应的云端文件 ID，根目录为 0。
-func (n *Node) FileID() int64 { return n.file.FileID }
-
-// File 返回节点对应的文件信息。
-func (n *Node) File() api.FileInfo { return n.file }
+func (n *Node) IsDir() bool { return n.isRoot || n.entry.IsDir }
 
 // IsRoot 表示是否根节点。
 func (n *Node) IsRoot() bool { return n.isRoot }
 
-// Loaded 表示该文件夹的子项是否已从缓存/接口加载过。
-func (n *Node) Loaded() bool { return n.loaded }
+// Path 返回相对 WebDAV 根目录的绝对路径，例如 "/电影/2024"。
+func (n *Node) Path() string { return n.path }
 
-// Path 返回从根开始的路径，用于日志展示。
-func (n *Node) Path() string {
+// DisplayPath 返回用于日志/状态栏的展示路径，例如 "我的云盘/电影/2024"。
+func (n *Node) DisplayPath() string {
 	if n.parent == nil {
-		if n.isRoot {
-			return "我的云盘"
-		}
-		return n.file.Filename
+		return "我的云盘"
 	}
-	return n.parent.Path() + "/" + n.file.Filename
+	return n.parent.DisplayPath() + "/" + n.entry.Name
 }
+
+// Entry 返回节点对应的文件信息。
+func (n *Node) Entry() store.Entry { return n.entry }
+
+// Loaded 表示该文件夹的子项是否已从缓存/WebDAV 加载过。
+func (n *Node) Loaded() bool { return n.loaded }
 
 // ChildDirs 返回直接子文件夹。
 func (n *Node) ChildDirs() []*Node {
@@ -152,32 +145,43 @@ func (m *TreeModel) RootAt(index int) walk.TreeItem { return m.root }
 // Root 返回根节点。
 func (m *TreeModel) Root() *Node { return m.root }
 
-// ApplyFolder 用最新的目录内容更新节点（保留已有子节点指针），
+// ApplyFolder 用最新的目录内容更新节点（按名称复用已有子节点指针），
 // 然后通知树控件刷新该节点的子树。必须在 UI 线程调用。
-func (m *TreeModel) ApplyFolder(node *Node, files []api.FileInfo) {
+func (m *TreeModel) ApplyFolder(node *Node, entries []store.Entry) {
 	if node == nil || !node.IsDir() {
 		return
 	}
 
-	old := make(map[int64]*Node, len(node.children))
+	old := make(map[string]*Node, len(node.children))
 	for _, c := range node.children {
-		old[c.file.FileID] = c
+		if c.placeholder {
+			continue
+		}
+		old[c.entry.Name] = c
 	}
 
-	children := make([]*Node, 0, len(files))
-	for _, f := range files {
-		if c, ok := old[f.FileID]; ok {
-			delete(old, f.FileID)
-			if c.file.IsDir() != f.IsDir() {
+	children := make([]*Node, 0, len(entries))
+	for _, e := range entries {
+		if e.Name == "" {
+			continue
+		}
+		if c, ok := old[e.Name]; ok {
+			delete(old, e.Name)
+			if c.entry.IsDir != e.IsDir {
 				// 类型发生变化（极端情况），丢弃旧的子树。
 				c.children = nil
 				c.loaded = false
 			}
-			c.file = f
+			c.entry = e
+			c.path = joinPath(node.path, e.Name)
 			children = append(children, c)
 			continue
 		}
-		children = append(children, &Node{parent: node, file: f})
+		children = append(children, &Node{
+			parent: node,
+			entry:  e,
+			path:   joinPath(node.path, e.Name),
+		})
 	}
 
 	for _, c := range children {
@@ -188,4 +192,11 @@ func (m *TreeModel) ApplyFolder(node *Node, files []api.FileInfo) {
 	node.loaded = true
 
 	m.PublishItemsReset(node)
+}
+
+func joinPath(parent, name string) string {
+	if parent == "/" || parent == "" {
+		return "/" + name
+	}
+	return path.Clean(parent + "/" + name)
 }
