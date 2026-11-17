@@ -1,126 +1,105 @@
 package ui
 
 import (
-	"strings"
 	"testing"
 
 	"pan123/internal/store"
 )
 
-// TestPlaceholderForUnloadedFolder 验证「未加载的文件夹」会带一个占位子项，
-// 否则 TreeView 无法展开它（从而懒加载/展开自动同步不会触发）。
-func TestPlaceholderForUnloadedFolder(t *testing.T) {
+// TestMergeChildrenKeepsNodes 验证刷新目录时按名称复用子节点指针。
+func TestMergeChildrenKeepsNodes(t *testing.T) {
 	root := NewRootNode()
-	if root.ChildCount() != 1 || !root.children[0].placeholder {
-		t.Fatalf("root should start with a placeholder child, got %#v", root.children)
-	}
-	if root.Path() != "/" {
-		t.Fatalf("root path = %q", root.Path())
-	}
-
-	model := NewTreeModel(root)
-	model.ApplyFolder(root, []store.Entry{
+	root.mergeChildren([]store.Entry{
 		{Name: "dir", IsDir: true},
-		{Name: "file.txt", Size: 3},
+		{Name: "a.txt", Size: 1},
 	})
-
-	if !root.Loaded() {
-		t.Fatal("root should be loaded after ApplyFolder")
-	}
-	if got := root.ChildCount(); got != 2 {
-		t.Fatalf("root children = %d, want 2", got)
-	}
-
-	dir := root.children[0]
-	if !dir.IsDir() || dir.Loaded() {
-		t.Fatalf("dir = %#v", dir)
-	}
-	if dir.Path() != "/dir" {
-		t.Fatalf("dir path = %q", dir.Path())
-	}
-	if got := dir.ChildCount(); got != 1 || !dir.children[0].placeholder {
-		t.Fatalf("unloaded dir should have exactly one placeholder child, got %d", got)
-	}
-	if txt := dir.ChildAt(0).Text(); txt == "" {
-		t.Fatal("placeholder item text must not be empty")
-	}
-
-	file := root.children[1]
-	if file.IsDir() || file.Path() != "/file.txt" {
-		t.Fatalf("file = %#v path=%q", file, file.Path())
-	}
-	if file.ChildCount() != 0 || file.HasChild() {
-		t.Fatal("file should have no children and no expander")
-	}
-	if txt := file.Text(); !strings.Contains(txt, "3 B") {
-		t.Fatalf("file text = %q", txt)
-	}
-
-	// 同步该目录后：占位子项被真实子项替换。
-	model.ApplyFolder(dir, []store.Entry{{Name: "inner.txt", Size: 1}})
-	if !dir.Loaded() || dir.ChildCount() != 1 {
-		t.Fatalf("dir after apply: loaded=%v children=%d", dir.Loaded(), dir.ChildCount())
-	}
-	inner := dir.children[0]
-	if inner.placeholder || inner.Path() != "/dir/inner.txt" {
-		t.Fatalf("inner = %#v", inner)
-	}
-
-	// 空的已加载目录不应再显示展开箭头。
-	model.ApplyFolder(dir, nil)
-	if dir.ChildCount() != 0 || dir.HasChild() {
-		t.Fatalf("empty loaded dir: children=%d HasChild=%v", dir.ChildCount(), dir.HasChild())
-	}
-}
-
-// TestApplyFolderKeepsNodes 验证按名称复用节点指针（walk 的 item↔handle 映射依赖它）。
-func TestApplyFolderKeepsNodes(t *testing.T) {
-	root := NewRootNode()
-	model := NewTreeModel(root)
-
-	model.ApplyFolder(root, []store.Entry{
-		{Name: "keep", IsDir: true},
-		{Name: "remove", IsDir: true},
-	})
-	keep := root.children[0]
-	remove := root.children[1]
-	if keep.entry.Name != "keep" || remove.entry.Name != "remove" {
-		t.Fatalf("children = %v", []string{keep.entry.Name, remove.entry.Name})
-	}
-
-	model.ApplyFolder(root, []store.Entry{
-		{Name: "keep", IsDir: true, ETag: "new-etag"},
-		{Name: "added", Size: 10},
-	})
-
 	if len(root.children) != 2 {
 		t.Fatalf("children = %d", len(root.children))
 	}
-	keptNode := root.children[0]
-	if keptNode != keep {
-		t.Fatal("existing node pointer should be reused")
+	dir := root.children[0]
+	file := root.children[1]
+	if dir.Path() != "/dir" || file.Path() != "/a.txt" {
+		t.Fatalf("paths = %q, %q", dir.Path(), file.Path())
 	}
-	if keptNode.Entry().ETag != "new-etag" {
-		t.Fatalf("entry not updated: %+v", keptNode.Entry())
+
+	dir.mergeChildren([]store.Entry{{Name: "inner.txt", Size: 2}})
+	inner := dir.children[0]
+	if inner.Path() != "/dir/inner.txt" {
+		t.Fatalf("inner path = %q", inner.Path())
 	}
-	if root.children[1].Entry().Name != "added" {
-		t.Fatalf("added child = %+v", root.children[1].Entry())
+
+	root.mergeChildren([]store.Entry{
+		{Name: "dir", IsDir: true, ETag: "changed"},
+		{Name: "b.txt", Size: 3},
+	})
+	if len(root.children) != 2 {
+		t.Fatalf("children = %d", len(root.children))
+	}
+	if root.children[0] != dir {
+		t.Fatal("dir node pointer should be reused")
+	}
+	if dir.Entry().ETag != "changed" {
+		t.Fatalf("entry not updated: %+v", dir.Entry())
+	}
+	if dir.children[0] != inner {
+		t.Fatal("grandchildren should be untouched")
+	}
+	if root.children[1].Entry().Name != "b.txt" {
+		t.Fatalf("new child = %+v", root.children[1].Entry())
 	}
 }
 
-// TestDisplayPath 验证日志用的展示路径。
-func TestDisplayPath(t *testing.T) {
+// TestOutlineChildren 验证 Outline 的展开箭头规则。
+func TestOutlineChildren(t *testing.T) {
 	root := NewRootNode()
-	model := NewTreeModel(root)
-	model.ApplyFolder(root, []store.Entry{{Name: "dir", IsDir: true}})
-	dir := root.children[0]
-	model.ApplyFolder(dir, []store.Entry{{Name: "a.bin", Size: 2048}})
+	root.mergeChildren([]store.Entry{
+		{Name: "dir", IsDir: true},
+		{Name: "empty", IsDir: true},
+		{Name: "file.txt", Size: 1},
+	})
 
-	file := dir.children[0]
-	if got := file.DisplayPath(); got != "我的云盘/dir/a.bin" {
-		t.Fatalf("display path = %q", got)
+	dir := root.children[0]
+	empty := root.children[1]
+	file := root.children[2]
+
+	// 未加载的文件夹：非 nil 空切片（显示箭头，展开后触发加载）。
+	if got := dir.outlineChildren(); got == nil || len(got) != 0 {
+		t.Fatalf("unloaded dir children = %#v", got)
 	}
-	if got := file.Path(); got != "/dir/a.bin" {
-		t.Fatalf("webdav path = %q", got)
+	// 文件：叶子。
+	if got := file.outlineChildren(); got != nil {
+		t.Fatalf("file children = %#v", got)
+	}
+	// 已加载的空文件夹：叶子。
+	empty.loaded = true
+	if got := empty.outlineChildren(); got != nil {
+		t.Fatalf("empty loaded dir children = %#v", got)
+	}
+	// 已加载且有子项。
+	dir.loaded = true
+	dir.mergeChildren([]store.Entry{{Name: "x", Size: 1}})
+	if got := dir.outlineChildren(); len(got) != 1 {
+		t.Fatalf("loaded dir children = %#v", got)
+	}
+}
+
+// TestFind 验证按路径查找节点。
+func TestFind(t *testing.T) {
+	root := NewRootNode()
+	root.mergeChildren([]store.Entry{{Name: "dir", IsDir: true}, {Name: "a.txt"}})
+	root.children[0].mergeChildren([]store.Entry{{Name: "inner", IsDir: true}})
+	root.children[0].children[0].mergeChildren([]store.Entry{{Name: "deep.txt"}})
+
+	if got := root.find("/"); got != root {
+		t.Fatalf("find(/) = %v", got)
+	}
+	if got := root.find("/dir/inner/deep.txt"); got == nil || got.DisplayPath() != "我的云盘/dir/inner/deep.txt" {
+		t.Fatalf("find deep = %v", got)
+	}
+	if got := root.find("/dir/nope"); got != nil {
+		t.Fatalf("find missing = %v", got)
+	}
+	if got := root.find("/a.txt/x"); got != nil {
+		t.Fatalf("find under file = %v", got)
 	}
 }

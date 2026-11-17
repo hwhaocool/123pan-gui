@@ -3,6 +3,8 @@ package ui
 import (
 	"fmt"
 	"time"
+
+	"pan123/internal/store"
 )
 
 // FormatSize 把字节数格式化为易读字符串。
@@ -31,20 +33,18 @@ func formatTime(t time.Time) string {
 	return t.Local().Format("2006-01-02 15:04:05")
 }
 
-// humanDuration 把时长格式化为「x 天 y 小时」之类的短文本。
-func humanDuration(d time.Duration) string {
-	if d < 0 {
-		d = 0
+// displayDir 把 WebDAV 路径转成展示路径，例如 "/电影/2024" -> "我的云盘/电影/2024"。
+func displayDir(p string) string {
+	p = store.NormalizePath(p)
+	if p == "/" {
+		return "我的云盘"
 	}
-	days := int(d.Hours()) / 24
-	hours := int(d.Hours()) % 24
-	mins := int(d.Minutes()) % 60
-	switch {
-	case days > 0:
-		return fmt.Sprintf("%d 天 %d 小时", days, hours)
-	case hours > 0:
-		return fmt.Sprintf("%d 小时 %d 分", hours, mins)
-	default:
-		return fmt.Sprintf("%d 分钟", mins)
+	return "我的云盘" + p
+}
+
+func onOff(b bool, yes, no string) string {
+	if b {
+		return yes
 	}
+	return no
 }

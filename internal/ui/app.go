@@ -1,90 +1,77 @@
-// Package ui 实现桌面界面（walk）。
+// Package ui 是 123 云盘客户端基于 mygo 原生 UI 的界面层。
 package ui
 
 import (
 	"context"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 
-	"github.com/lxn/walk"
-	. "github.com/lxn/walk/declarative"
+	"github.com/egoist/mygo"
+	"github.com/egoist/mygo/ui"
 
 	"pan123/internal/config"
 	"pan123/internal/store"
 	"pan123/internal/webdav"
 )
 
-// App 保存应用的运行状态。
+// App 保存应用状态，并实现 mygo 的视图函数。
 type App struct {
 	cfg     *config.Config
 	cfgPath string
 
 	cache  *store.Cache
 	client *webdav.Client
-	model  *TreeModel
-	root   *Node
 	syncer *Syncer
+	root   *Node
 
-	mw         *walk.MainWindow
-	tv         *walk.TreeView
-	logEdit    *walk.TextEdit
-	infoItem   *walk.StatusBarItem
-	statusItem *walk.StatusBarItem
+	win    *mygo.Window
+	closed atomic.Bool
 
-	syncBtn     *walk.PushButton
-	syncAllBtn  *walk.PushButton
-	stopBtn     *walk.PushButton
-	settingsBtn *walk.PushButton
-	subdirs     *walk.CheckBox
+	outline       ui.OutlineState[*Node]
+	selectedRow   int
+	selected      *Node
+	pendingReveal *Node
 
-	tabs        *walk.TabWidget
-	searchEdit  *walk.LineEdit
-	searchTable *walk.TableView
-	searchInfo  *walk.Label
-	searchModel *searchModel
+	includeSubdirs bool
+	busy           bool
+	status         string
+	info           string
 
-	closed   atomic.Bool
-	logLines int
+	logs      []string
+	logList   ui.ListState
+	logHeight float32
+
+	searchQuery    string
+	searchResults  []store.SearchHit
+	searchList     ui.ListState
+	searchSelected int
+	showResults    bool
+
+	settingsOpen    bool
+	draft           settingsDraft
+	settingsStatus  string
+	settingsTesting bool
+
+	confirmSyncAll bool
+
+	initErr error
 }
 
-// Run 启动应用（阻塞直到窗口关闭）。
-func Run() error {
-	a := &App{}
-	if err := a.init(); err != nil {
-		return err
+// NewApp 读取配置、打开本地数据库并准备好 WebDAV 客户端。
+// 初始化失败时返回带 initErr 的 App，界面会显示错误信息。
+func NewApp() *App {
+	a := &App{
+		status:         "就绪",
+		includeSubdirs: true,
+		logHeight:      170,
+		selectedRow:    -1,
+		searchSelected: -1,
 	}
-	if err := a.build(); err != nil {
-		return err
-	}
-	a.syncer.Start()
 
-	a.mw.Starting().Attach(func() { go a.bootstrap() })
-	a.mw.Closing().Attach(func(canceled *bool, reason walk.CloseReason) {
-		a.closed.Store(true)
-		a.syncer.Close()
-
-		if t := a.cache.LastSyncedAt(); !t.IsZero() {
-			a.cfg.LastSyncAt = t
-		}
-		if err := a.cfg.Save(a.cfgPath); err != nil {
-			log.Printf("保存配置失败: %v", err)
-		}
-		if err := a.cache.Flush(); err != nil {
-			log.Printf("合并数据库失败: %v", err)
-		}
-		if err := a.cache.Close(); err != nil {
-			log.Printf("关闭数据库失败: %v", err)
-		}
-	})
-
-	a.mw.Run()
-	return nil
-}
-
-func (a *App) init() error {
 	cfg, path, err := config.Load()
 	if err != nil {
 		log.Printf("加载配置: %v", err)
@@ -93,17 +80,16 @@ func (a *App) init() error {
 
 	cachePath, err := config.CachePath()
 	if err != nil {
-		return fmt.Errorf("无法确定数据库路径: %w", err)
+		a.initErr = fmt.Errorf("无法确定数据库路径: %w", err)
+		return a
 	}
 	a.cache, err = store.Open(cachePath)
 	if err != nil {
-		return fmt.Errorf("打开本地数据库失败: %w", err)
+		a.initErr = fmt.Errorf("打开本地数据库失败: %w", err)
+		return a
 	}
 
 	a.root = NewRootNode()
-	a.model = NewTreeModel(a.root)
-	a.searchModel = &searchModel{}
-
 	a.client = webdav.New(a.clientOptions())
 	a.client.OnWait = func(d time.Duration) {
 		if d >= 2*time.Second {
@@ -112,30 +98,59 @@ func (a *App) init() error {
 	}
 
 	a.syncer = NewSyncer(a.client, a.cache)
-	a.syncer.synchronize = func(f func()) {
-		if a.mw != nil {
-			a.mw.Synchronize(f)
-		}
-	}
-	a.syncer.apply = func(n *Node, entries []store.Entry) { a.model.ApplyFolder(n, entries) }
+	a.syncer.synchronize = func(f func()) { mygo.RunOnMain(f) }
+	a.syncer.apply = func(n *Node, entries []store.Entry) { a.applyEntries(n, entries) }
 	a.syncer.logf = a.logf
-	a.syncer.status = a.setStatus
-	a.syncer.busy = a.setBusy
+	a.syncer.status = func(s string) { a.async(func() { a.status = s }) }
+	a.syncer.busy = func(b bool) { a.async(func() { a.busy = b }) }
 	a.syncer.done = func(n *Node) {
-		// 同步结束后展开该节点，让用户立刻看到结果。
-		a.postUI(func() {
-			if a.tv != nil {
-				_ = a.tv.SetExpanded(n, true)
+		a.async(func() {
+			n.loading = false
+			if n.loaded {
+				n.loadFailed = false
+				a.outline.Open.Add(n)
+			} else {
+				n.loadFailed = true
 			}
-			// 搜索结果来自本地缓存，同步完成后顺手刷新一下当前结果。
-			if a.tabs != nil && a.tabs.CurrentIndex() == 1 && a.searchEdit != nil &&
-				strings.TrimSpace(a.searchEdit.Text()) != "" {
-				a.performSearch(false)
+			if t := a.cache.LastSyncedAt(); !t.IsZero() {
+				a.cfg.LastSyncAt = t
+				if err := a.cfg.Save(a.cfgPath); err != nil {
+					a.addLog("保存配置失败：%v", err)
+				}
 			}
 		})
 	}
 
-	return nil
+	return a
+}
+
+// Attach 在窗口创建后调用：启动同步 worker 并开始首次加载。
+func (a *App) Attach(win *mygo.Window) {
+	a.win = win
+	if a.initErr != nil {
+		return
+	}
+	a.syncer.Start()
+	go a.bootstrap()
+}
+
+// Shutdown 在应用退出后调用：停止同步、合并并关闭数据库、保存配置。
+func (a *App) Shutdown() {
+	a.closed.Store(true)
+	if a.syncer != nil {
+		a.syncer.Close()
+	}
+	if a.cache != nil {
+		last := a.cache.LastSyncedAt()
+		if a.cfg != nil && !last.IsZero() {
+			a.cfg.LastSyncAt = last
+		}
+		_ = a.cache.Flush()
+		_ = a.cache.Close()
+	}
+	if a.cfg != nil && a.cfgPath != "" {
+		_ = a.cfg.Save(a.cfgPath)
+	}
 }
 
 func (a *App) clientOptions() webdav.Options {
@@ -149,176 +164,438 @@ func (a *App) clientOptions() webdav.Options {
 	}
 }
 
-func (a *App) build() error {
-	err := MainWindow{
-		AssignTo: &a.mw,
-		Title:    "123 云盘客户端（WebDAV）",
-		Size:     Size{960, 680},
-		MinSize:  Size{720, 480},
-		Layout:   VBox{MarginsZero: true},
-		Children: []Widget{
-			Composite{
-				Layout: HBox{
-					Margins: Margins{Left: 8, Top: 8, Right: 8, Bottom: 4},
-					Spacing: 6,
-				},
-				Children: []Widget{
-					PushButton{
-						AssignTo:  &a.syncBtn,
-						Text:      "同步选中目录",
-						MinSize:   Size{110, 0},
-						OnClicked: a.onSyncSelected,
-					},
-					PushButton{
-						AssignTo:  &a.syncAllBtn,
-						Text:      "同步全部",
-						MinSize:   Size{90, 0},
-						OnClicked: a.onSyncAll,
-					},
-					PushButton{
-						AssignTo:  &a.stopBtn,
-						Text:      "停止",
-						Enabled:   false,
-						MinSize:   Size{70, 0},
-						OnClicked: a.onStop,
-					},
-					CheckBox{
-						AssignTo: &a.subdirs,
-						Text:     "包含子目录",
-						Checked:  true,
-					},
-					HSpacer{},
-					PushButton{
-						AssignTo:  &a.settingsBtn,
-						Text:      "设置…",
-						MinSize:   Size{80, 0},
-						OnClicked: a.onSettings,
-					},
-				},
-			},
-			Composite{
-				Layout: HBox{
-					Margins: Margins{Left: 8, Top: 0, Right: 8, Bottom: 6},
-					Spacing: 6,
-				},
-				Children: []Widget{
-					Label{Text: "搜索（仅本地缓存）：", MinSize: Size{130, 0}},
-					LineEdit{
-						AssignTo:      &a.searchEdit,
-						MinSize:       Size{200, 0},
-						StretchFactor: 1,
-						OnKeyDown:     a.onSearchKeyDown,
-					},
-					PushButton{Text: "搜索", MinSize: Size{70, 0}, OnClicked: a.onSearch},
-					PushButton{Text: "清除", MinSize: Size{70, 0}, OnClicked: a.onClearSearch},
-				},
-			},
-			VSplitter{
-				Children: []Widget{
-					TabWidget{
-						AssignTo: &a.tabs,
-						MinSize:  Size{0, 220},
-						Pages: []TabPage{
-							{
-								Title:  "目录树",
-								Layout: VBox{MarginsZero: true},
-								Children: []Widget{
-									TreeView{
-										AssignTo:             &a.tv,
-										Model:                a.model,
-										OnExpandedChanged:    a.onExpanded,
-										OnCurrentItemChanged: a.onSelectionChanged,
-										OnItemActivated:      a.onItemActivated,
-									},
-								},
-							},
-							{
-								Title:  "搜索结果",
-								Layout: VBox{Margins: Margins{Left: 6, Top: 6, Right: 6, Bottom: 6}, Spacing: 4},
-								Children: []Widget{
-									Composite{
-										Layout: HBox{Spacing: 6},
-										Children: []Widget{
-											Label{
-												AssignTo: &a.searchInfo,
-												Text:     "输入关键字后点击「搜索」（只查本地缓存，忽略大小写）",
-											},
-											HSpacer{},
-											PushButton{
-												Text:      "返回目录树",
-												MinSize:   Size{90, 0},
-												OnClicked: func() { a.showTree() },
-											},
-										},
-									},
-									TableView{
-										AssignTo:         &a.searchTable,
-										Model:            a.searchModel,
-										StretchFactor:    1,
-										ColumnsOrderable: true,
-										OnItemActivated:  a.onSearchActivated,
-										Columns: []TableViewColumn{
-											{Title: "名称", Width: 300},
-											{Title: "类型", Width: 80},
-											{Title: "大小", Width: 100, Alignment: AlignFar},
-											{Title: "位置", Width: 360},
-										},
-									},
-								},
-							},
-						},
-					},
-					TextEdit{
-						AssignTo: &a.logEdit,
-						ReadOnly: true,
-						HScroll:  true,
-						VScroll:  true,
-						MinSize:  Size{0, 110},
-					},
-				},
-			},
-		},
-		StatusBarItems: []StatusBarItem{
-			{AssignTo: &a.infoItem, Text: "就绪"},
-			{AssignTo: &a.statusItem, Text: "", Width: 340},
-		},
-	}.Create()
-	if err != nil {
-		return err
+//
+// 视图
+//
+
+// View 构建窗口界面（mygo 每帧调用）。
+func (a *App) View(c *ui.Context) {
+	t := c.Theme()
+
+	if a.initErr != nil {
+		a.errorView(c, t)
+		return
+	}
+	if a.settingsOpen {
+		a.settingsView(c, t)
+		return
 	}
 
-	a.setInfo("就绪")
-	a.setStatus("")
-	return nil
+	// 先读取展开目录的本地缓存 / 提交同步，再构建树。
+	a.reconcile()
+
+	ui.Column(c).Fill().Gap(0).Children(func() {
+		a.toolbar(c)
+		ui.Divider(c)
+		ui.SplitVertical(c, &a.logHeight, func() {
+			if a.showResults {
+				a.resultsView(c, t)
+			} else {
+				a.treeView(c, t)
+			}
+		}, func() {
+			a.logView(c, t)
+		}).Grow(1)
+		ui.Divider(c)
+		a.statusBar(c, t)
+	})
+
+	a.alert(c)
 }
 
-// bootstrap 在窗口显示后执行：读缓存 + 检查连接 + 首次自动同步。
-func (a *App) bootstrap() {
-	time.Sleep(150 * time.Millisecond)
+func (a *App) errorView(c *ui.Context, t *ui.Theme) {
+	ui.Column(c).Fill().Padding(24).Gap(10).Children(func() {
+		ui.Text(c, "启动失败").FontSize(20).Bold()
+		ui.Text(c, a.initErr.Error()).TextColor(t.Danger)
+	})
+}
 
-	a.logf("123 云盘客户端已启动（WebDAV 模式）")
-	a.logf("配置文件：%s", a.cfgPath)
-	a.logf("数据库：%s", a.cache.Path())
-	a.logf("限速：QPS=%.1f（两次请求最小间隔 %s），可在「设置…」中调整", a.client.QPS(), a.client.Interval())
-
-	if folders, items := a.cache.Stats(); folders > 0 {
-		a.logf("本地缓存：%d 个已同步目录 / %d 项，最近同步于 %s",
-			folders, items, formatTime(a.cache.LastSyncedAt()))
-	}
-
-	rootCached := false
-	if entries, ok := a.cache.Children("/"); ok {
-		rootCached = true
-		a.postUI(func() {
-			a.model.ApplyFolder(a.root, entries)
-			_ = a.tv.SetExpanded(a.root, true)
+func (a *App) toolbar(c *ui.Context) {
+	ui.Row(c).Padding(10, 8).Gap(8).AlignItems(ui.Center).Children(func() {
+		ui.PrimaryButton(c, "同步选中目录").
+			Disabled(a.busy).
+			OnClick(a.syncSelected)
+		ui.Button(c, "同步全部").Disabled(a.busy).OnClick(func() { a.confirmSyncAll = true })
+		ui.Button(c, "停止").Disabled(!a.busy).OnClick(func() {
+			a.syncer.Stop()
+			a.status = "正在停止…"
 		})
-		a.logf("已从本地数据库加载根目录（%d 项）", len(entries))
+		ui.Checkbox(c, &a.includeSubdirs, "包含子目录")
+
+		ui.Spacer(c)
+
+		if ui.SearchField(c, &a.searchQuery).
+			Placeholder("搜索文件名 / 文件夹（仅本地缓存）").
+			Width(300).
+			Changed() {
+			a.runSearch(false)
+		}
+		if a.showResults {
+			if ui.Button(c, "返回目录树").Clicked() {
+				a.showResults = false
+			}
+		} else if strings.TrimSpace(a.searchQuery) != "" {
+			if ui.Button(c, "查看搜索结果").Clicked() {
+				a.showResults = true
+			}
+		}
+		ui.Button(c, "设置…").Disabled(a.busy).OnClick(a.openSettings)
+	})
+}
+
+func (a *App) treeView(c *ui.Context, t *ui.Theme) {
+	if a.root == nil {
+		return
 	}
+
+	a.outline.List.Selected = &a.selectedRow
+	ui.Outline(c, &a.outline, []*Node{a.root}, func(n *Node) []*Node {
+		return n.outlineChildren()
+	}, func(n *Node) {
+		icon := ui.Box(c).Size(14, 14).Radius(3).Shrink(0)
+		if n.IsDir() {
+			icon.Background(t.Accent.Alpha(0.22))
+		} else {
+			icon.Background(t.TextMuted.Alpha(0.18))
+		}
+		ui.Text(c, n.Name()).SingleLine()
+		if !n.IsDir() {
+			ui.Text(c, FormatSize(n.Entry().Size)).TextColor(t.TextMuted).SingleLine()
+		}
+		if n.loading {
+			ui.Spinner(c)
+		}
+	}).Grow(1).Label("云盘目录")
+
+	// Outline 在构建中写入选中行，构建后读取选中的节点。
+	if a.selectedRow >= 0 && a.selectedRow < a.outline.Rows() {
+		a.selected = a.outline.Item(a.selectedRow)
+	} else {
+		a.selected = nil
+	}
+	a.scrollToPendingReveal(c)
+}
+
+func (a *App) resultsView(c *ui.Context, t *ui.Theme) {
+	ui.Column(c).Fill().Children(func() {
+		ui.Row(c).Padding(10, 6).Gap(8).AlignItems(ui.Center).Children(func() {
+			caption := fmt.Sprintf("搜索「%s」：%d 条结果（仅本地缓存）", strings.TrimSpace(a.searchQuery), len(a.searchResults))
+			ui.Text(c, caption).TextColor(t.TextMuted).Grow(1).SingleLine()
+			if ui.Button(c, "返回目录树").Clicked() {
+				a.showResults = false
+			}
+		})
+
+		a.searchList.Selected = &a.searchSelected
+		a.searchList.Key = func(i int) any { return a.searchResults[i].Path }
+		cols := []ui.TableColumn{
+			{Title: "名称"},
+			{Title: "类型", Width: 80},
+			{Title: "大小", Width: 110, Align: ui.End},
+			{Title: "位置", Width: 340},
+		}
+		if ui.Table(c, &a.searchList, cols, len(a.searchResults), func(row, col int) {
+			h := a.searchResults[row]
+			switch col {
+			case 0:
+				ui.Text(c, h.Name).SingleLine()
+			case 1:
+				if h.IsDir {
+					ui.Text(c, "文件夹")
+				} else {
+					ui.Text(c, "文件")
+				}
+			case 2:
+				if !h.IsDir {
+					ui.Text(c, FormatSize(h.Size))
+				}
+			case 3:
+				ui.Text(c, displayDir(h.Parent)).TextColor(t.TextMuted).SingleLine()
+			}
+		}).Grow(1).Label("搜索结果").Submitted() {
+			if a.searchSelected >= 0 && a.searchSelected < len(a.searchResults) {
+				a.reveal(a.searchResults[a.searchSelected])
+			}
+		}
+	})
+}
+
+func (a *App) logView(c *ui.Context, t *ui.Theme) {
+	ui.Column(c).Fill().Background(t.Surface).Children(func() {
+		ui.Row(c).Padding(10, 4).Gap(8).AlignItems(ui.Center).Children(func() {
+			ui.Text(c, "日志").Bold()
+			ui.Spacer(c)
+			if ui.Button(c, "清空").Clicked() {
+				a.logs = nil
+			}
+		})
+		a.logList.FollowEnd = true
+		ui.List(c, &a.logList, len(a.logs), func(i int) {
+			ui.Text(c, a.logs[i]).SingleLine().Padding(1, 10)
+		}).Grow(1)
+	})
+}
+
+func (a *App) statusBar(c *ui.Context, t *ui.Theme) {
+	ui.Row(c).Padding(10, 6).Gap(10).AlignItems(ui.Center).Children(func() {
+		ui.Text(c, a.infoText()).TextColor(t.TextMuted).Grow(1).SingleLine()
+		if a.busy {
+			ui.Spinner(c)
+		}
+		ui.Text(c, a.status).SingleLine()
+	})
+}
+
+func (a *App) alert(c *ui.Context) {
+	if ui.AlertDialog(c, &a.confirmSyncAll, "同步全部",
+		"将递归同步整个 WebDAV 目录树；目录较多时可能需要较长时间，是否继续？",
+		"取消", "开始同步") == 1 {
+		a.syncAll()
+	}
+}
+
+//
+// 交互
+//
+
+func (a *App) infoText() string {
+	n := a.selected
+	if n == nil {
+		if a.info != "" {
+			return a.info
+		}
+		return "就绪"
+	}
+
+	if n.IsDir() {
+		dirs, files := 0, 0
+		for _, c := range n.Children() {
+			if c.IsDir() {
+				dirs++
+			} else {
+				files++
+			}
+		}
+		if n.Loaded() {
+			synced := "已加载"
+			if at, ok := a.cache.SyncedAt(n.Path()); ok {
+				synced = formatTime(at)
+			}
+			return fmt.Sprintf("目录：%s　|　%d 个子目录 / %d 个文件　|　同步于 %s", n.DisplayPath(), dirs, files, synced)
+		}
+		return fmt.Sprintf("目录：%s　|　子项未加载（展开或点击「同步选中目录」）", n.DisplayPath())
+	}
+
+	e := n.Entry()
+	etag := e.ETag
+	if etag == "" {
+		etag = "-"
+	}
+	return fmt.Sprintf("文件：%s　|　%s　|　修改于 %s　|　ETag %s",
+		n.DisplayPath(), FormatSize(e.Size), formatTime(e.Modified), etag)
+}
+
+func (a *App) syncSelected() {
+	n := a.selected
+	if n == nil {
+		n = a.root
+	}
+	if n == nil || !n.IsDir() {
+		a.addLog("请先在目录树中选择一个文件夹")
+		a.status = "请选择文件夹"
+		return
+	}
+	a.submitSync(n, a.includeSubdirs)
+}
+
+func (a *App) syncAll() {
+	if a.root == nil {
+		return
+	}
+	a.submitSync(a.root, true)
+}
+
+func (a *App) submitSync(n *Node, recursive bool) {
+	if !a.client.Configured() {
+		a.addLog("尚未配置 WebDAV 地址，请打开「设置…」")
+		a.status = "未配置 WebDAV"
+		return
+	}
+	n.loadFailed = false
+	if err := a.syncer.Submit(&Job{Node: n, Recursive: recursive, Reason: "manual"}); err != nil {
+		a.addLog("未能加入同步队列：%v", err)
+		return
+	}
+	a.addLog("已加入同步队列：%s（%s）", n.DisplayPath(), onOff(recursive, "含子目录", "仅本层"))
+}
+
+// reconcile 在构建界面前调用：展开但尚未加载的目录，先读本地缓存，
+// 没有缓存再提交一次「仅本层」的同步。
+func (a *App) reconcile() {
+	if a.root == nil {
+		return
+	}
+	for n := range a.outline.Open.All() {
+		if n.IsDir() && !n.loaded && !n.loading && !n.loadFailed {
+			a.loadNode(n)
+		}
+	}
+}
+
+func (a *App) loadNode(n *Node) {
+	if entries, ok := a.cache.Children(n.Path()); ok {
+		a.applyEntries(n, entries)
+		return
+	}
+	if !a.client.Configured() {
+		n.loadFailed = true
+		a.addLog("目录 %s 没有本地缓存，且未配置 WebDAV", n.DisplayPath())
+		return
+	}
+	n.loading = true
+	if err := a.syncer.Submit(&Job{Node: n, Recursive: false, Reason: "expand"}); err != nil {
+		n.loading = false
+		n.loadFailed = true
+		a.addLog("自动同步失败：%v", err)
+	} else {
+		a.addLog("展开「%s」：没有缓存，自动同步一层…", n.DisplayPath())
+	}
+}
+
+func (a *App) applyEntries(n *Node, entries []store.Entry) {
+	if n == nil || !n.IsDir() {
+		return
+	}
+	n.mergeChildren(entries)
+	n.loaded = true
+	n.loading = false
+	n.loadFailed = false
+}
+
+func (a *App) runSearch(announce bool) {
+	q := strings.TrimSpace(a.searchQuery)
+	if q == "" {
+		a.searchResults = nil
+		a.showResults = false
+		a.searchSelected = -1
+		return
+	}
+
+	hits, err := a.cache.Search(q, 500)
+	if err != nil {
+		a.addLog("本地搜索失败：%v", err)
+		a.status = "搜索失败"
+		return
+	}
+	a.searchResults = hits
+	a.searchSelected = -1
+	a.showResults = true
+	if announce {
+		if len(hits) == 0 {
+			a.addLog("搜索「%s」：本地缓存中没有匹配项", q)
+		} else {
+			a.addLog("搜索「%s」：%d 条结果（仅本地缓存）", q, len(hits))
+		}
+	}
+}
+
+// reveal 在目录树中定位一条搜索结果：只从本地缓存展开祖先目录，不访问网络。
+func (a *App) reveal(hit store.SearchHit) {
+	p := store.NormalizePath(hit.Path)
+	if entries, ok := a.cache.Children("/"); ok {
+		a.applyEntries(a.root, entries)
+	}
+	a.outline.Open.Add(a.root)
+
+	segs := strings.Split(strings.TrimPrefix(p, "/"), "/")
+	node := a.root
+	for i, seg := range segs {
+		if seg == "" {
+			continue
+		}
+		var next *Node
+		for _, c := range node.Children() {
+			if c.Entry().Name == seg {
+				next = c
+				break
+			}
+		}
+		if next == nil {
+			a.addLog("无法定位：%s 的上级目录尚未缓存", p)
+			a.status = "无法定位"
+			return
+		}
+		node = next
+		if node.IsDir() && i < len(segs)-1 {
+			if entries, ok := a.cache.Children(node.Path()); ok {
+				a.applyEntries(node, entries)
+			} else {
+				a.addLog("无法定位：%s 尚未缓存", node.DisplayPath())
+				a.status = "无法定位"
+				return
+			}
+			a.outline.Open.Add(node)
+		}
+	}
+	if node.IsDir() {
+		a.outline.Open.Add(node)
+	}
+
+	a.showResults = false
+	a.pendingReveal = node
+	a.status = "已定位：" + node.DisplayPath()
+}
+
+// scrollToPendingReveal 在 Outline 构建后找到目标行并滚动过去。
+func (a *App) scrollToPendingReveal(c *ui.Context) {
+	if a.pendingReveal == nil {
+		return
+	}
+	for i := 0; i < a.outline.Rows(); i++ {
+		if a.outline.Item(i) == a.pendingReveal {
+			a.selectedRow = i
+			a.selected = a.pendingReveal
+			a.outline.List.ScrollTo(i, ui.Center)
+			a.pendingReveal = nil
+			c.Invalidate()
+			return
+		}
+	}
+}
+
+//
+// 后台任务与状态更新
+//
+
+func (a *App) bootstrap() {
+	if a.initErr != nil {
+		return
+	}
+
+	a.async(func() {
+		a.addLog("123 云盘客户端已启动（mygo 原生 UI）")
+		a.addLog("配置文件：%s", a.cfgPath)
+		a.addLog("数据库：%s", a.cache.Path())
+		a.addLog("限速：QPS=%.1f（两次请求最小间隔 %s）", a.client.QPS(), a.client.Interval())
+
+		if folders, items := a.cache.Stats(); folders > 0 {
+			a.addLog("本地缓存：%d 个已同步目录 / %d 项，最近同步于 %s", folders, items, formatTime(a.cache.LastSyncedAt()))
+		}
+		if entries, ok := a.cache.Children("/"); ok {
+			a.applyEntries(a.root, entries)
+			a.outline.Open.Add(a.root)
+			a.addLog("已从本地数据库加载根目录（%d 项）", len(entries))
+		} else {
+			a.addLog("本地还没有根目录缓存")
+		}
+	})
 
 	if !a.client.Configured() {
-		a.logf("尚未配置 WebDAV 地址，请点击「设置…」填写后再同步")
-		a.setInfo("未配置 WebDAV 地址")
+		a.async(func() {
+			a.addLog("尚未配置 WebDAV 地址，请点击「设置…」填写后再同步")
+			a.info = "未配置 WebDAV 地址"
+			a.status = "等待配置"
+		})
 		return
 	}
 
@@ -326,376 +603,69 @@ func (a *App) bootstrap() {
 	err := a.client.Check(ctx)
 	cancel()
 	if err != nil {
-		a.logf("WebDAV 连接失败：%v", err)
-		if webdav.IsAuthError(err) {
-			a.logf("提示：123 云盘 WebDAV 请使用官方文档中的 WebDAV 用户名/密码；账号未开通或无权限时也会返回 401。")
-		}
-		a.setInfo("WebDAV 连接失败（仍可浏览本地缓存）")
+		a.async(func() {
+			a.addLog("WebDAV 连接失败：%v", err)
+			if webdav.IsAuthError(err) {
+				a.addLog("提示：123 云盘 WebDAV 请使用官方文档中的 WebDAV 用户名/密码；账号未开通或无权限时也会返回 401。")
+			}
+			a.info = "WebDAV 连接失败（仍可浏览本地缓存）"
+			a.status = "连接失败"
+		})
 		return
 	}
 
-	a.logf("WebDAV 连接正常：%s", a.client.BaseURL())
-	a.setInfo(fmt.Sprintf("已连接 · QPS %.1f", a.client.QPS()))
+	a.async(func() {
+		a.addLog("WebDAV 连接正常：%s", a.client.BaseURL())
+		a.info = fmt.Sprintf("已连接 · QPS %.1f", a.client.QPS())
+		a.status = "就绪"
+	})
 
-	if !rootCached {
-		a.logf("将自动同步根目录（仅第一层）…")
+	if _, ok := a.cache.Children("/"); !ok {
+		a.async(func() {
+			a.addLog("将自动同步根目录（仅第一层）…")
+			a.root.loading = true
+		})
 		if err := a.syncer.Submit(&Job{Node: a.root, Recursive: false, Reason: "startup"}); err != nil {
-			a.logf("提交同步任务失败：%v", err)
+			a.async(func() {
+				a.root.loading = false
+				a.addLog("提交同步任务失败：%v", err)
+			})
 		}
 	}
 }
 
-func (a *App) selectedNode() *Node {
-	if a.tv == nil {
-		return nil
+// async 把修改状态的函数投递到主线程并重绘；窗口销毁后丢弃。
+func (a *App) async(fn func()) {
+	if a.win == nil || a.closed.Load() {
+		return
 	}
-	if n, ok := a.tv.CurrentItem().(*Node); ok {
-		return n
-	}
-	return nil
+	a.win.Update(fn)
 }
 
-func (a *App) onSyncSelected() {
-	node := a.selectedNode()
-	if node == nil {
-		walk.MsgBox(a.mw, "提示", "请先在树中选中一个文件夹。", walk.MsgBoxIconInformation)
-		return
-	}
-	a.submit(node, a.subdirs.Checked())
-}
-
-func (a *App) onSyncAll() {
-	if !a.client.Configured() {
-		walk.MsgBox(a.mw, "未配置 WebDAV", "请先在「设置…」中填写 WebDAV 地址（以及用户名/密码）。", walk.MsgBoxIconInformation)
-		return
-	}
-	msg := "将递归同步整个 WebDAV 目录树。\n\n目录较多时可能需要较长时间，是否继续？"
-	if walk.MsgBox(a.mw, "同步全部", msg, walk.MsgBoxYesNo|walk.MsgBoxIconQuestion) != walk.DlgCmdYes {
-		return
-	}
-	a.submit(a.root, true)
-}
-
-func (a *App) submit(node *Node, recursive bool) {
-	if node == nil || !node.IsDir() {
-		walk.MsgBox(a.mw, "提示", "只能同步文件夹。", walk.MsgBoxIconInformation)
-		return
-	}
-	if !a.client.Configured() {
-		walk.MsgBox(a.mw, "未配置 WebDAV", "请先在「设置…」中填写 WebDAV 地址（以及用户名/密码）。", walk.MsgBoxIconInformation)
-		return
-	}
-
-	err := a.syncer.Submit(&Job{Node: node, Recursive: recursive, Reason: "manual"})
-	if err != nil {
-		a.logf("未能加入同步队列：%v", err)
-		return
-	}
-	a.logf("已加入同步队列：%s（%s）", node.DisplayPath(), onOff(recursive, "含子目录", "仅本层"))
-}
-
-func (a *App) onStop() {
-	a.syncer.Stop()
-	a.statusf("正在停止…")
-}
-
-func (a *App) onExpanded(item walk.TreeItem) {
-	node, ok := item.(*Node)
-	if !ok || !node.IsDir() || a.tv == nil || !a.tv.Expanded(node) || node.Loaded() {
-		return
-	}
-
-	// 优先使用本地数据库（离线可用，不消耗请求）。
-	if entries, ok := a.cache.Children(node.Path()); ok {
-		// 延后到当前消息处理完毕再刷新，避免在展开事件里重入 TreeView。
-		a.postUI(func() {
-			a.model.ApplyFolder(node, entries)
-			_ = a.tv.SetExpanded(node, true)
-		})
-		syncedAt, _ := a.cache.SyncedAt(node.Path())
-		a.logf("展开「%s」：从缓存加载 %d 项（缓存于 %s）", node.DisplayPath(), len(entries), formatTime(syncedAt))
-		return
-	}
-
-	if !a.client.Configured() {
-		return
-	}
-
-	a.logf("展开「%s」：没有缓存，自动同步一层…", node.DisplayPath())
-	if err := a.syncer.Submit(&Job{Node: node, Recursive: false, Reason: "expand"}); err != nil {
-		a.logf("自动同步失败：%v", err)
-	}
-}
-
-func (a *App) onItemActivated() {
-	node := a.selectedNode()
-	if node == nil || !node.IsDir() || node.Loaded() {
-		return
-	}
-	if entries, ok := a.cache.Children(node.Path()); ok {
-		a.postUI(func() {
-			a.model.ApplyFolder(node, entries)
-			_ = a.tv.SetExpanded(node, true)
-		})
-		return
-	}
-	if a.client.Configured() {
-		_ = a.syncer.Submit(&Job{Node: node, Recursive: false, Reason: "activate"})
-		a.logf("双击「%s」：自动同步一层…", node.DisplayPath())
-	}
-}
-
-func (a *App) onSelectionChanged() {
-	node := a.selectedNode()
-	if node == nil {
-		return
-	}
-	if node.IsDir() {
-		dirs, files := 0, 0
-		for _, c := range node.children {
-			if c.placeholder {
-				continue
-			}
-			if c.IsDir() {
-				dirs++
-			} else {
-				files++
-			}
-		}
-		if node.Loaded() {
-			state := "已加载"
-			if syncedAt, ok := a.cache.SyncedAt(node.Path()); ok {
-				state = formatTime(syncedAt)
-			}
-			a.setInfo(fmt.Sprintf("目录：%s　|　%d 个子目录 / %d 个文件　|　同步于 %s",
-				node.DisplayPath(), dirs, files, state))
-		} else {
-			a.setInfo(fmt.Sprintf("目录：%s　|　子项未加载（展开或点击「同步选中目录」）", node.DisplayPath()))
-		}
-		return
-	}
-
-	e := node.Entry()
-	etag := e.ETag
-	if etag == "" {
-		etag = "-"
-	}
-	a.setInfo(fmt.Sprintf("文件：%s　|　%s　|　修改于 %s　|　ETag %s",
-		node.DisplayPath(), FormatSize(e.Size), formatTime(e.Modified), etag))
-}
-
-//
-// 搜索（只查本地 SQLite 缓存，不访问网络）
-//
-
-func (a *App) onSearchKeyDown(key walk.Key) {
-	if key == walk.KeyReturn {
-		a.onSearch()
-	}
-}
-
-func (a *App) onSearch() {
-	if a.searchEdit == nil {
-		return
-	}
-	a.performSearch(true)
-	if a.tabs != nil {
-		_ = a.tabs.SetCurrentIndex(1)
-	}
-}
-
-func (a *App) onClearSearch() {
-	if a.searchEdit != nil {
-		a.searchEdit.SetText("")
-	}
-	if a.searchModel != nil {
-		a.searchModel.SetHits(nil)
-	}
-	if a.searchInfo != nil {
-		a.searchInfo.SetText("输入关键字后点击「搜索」（只查本地缓存，忽略大小写）")
-	}
-	a.showTree()
-}
-
-func (a *App) showTree() {
-	if a.tabs != nil {
-		_ = a.tabs.SetCurrentIndex(0)
-	}
-}
-
-// performSearch 在本地缓存中做模糊搜索；announce 为 true 时写一条日志。
-func (a *App) performSearch(announce bool) {
-	if a.searchEdit == nil || a.searchModel == nil || a.searchInfo == nil {
-		return
-	}
-
-	q := strings.TrimSpace(a.searchEdit.Text())
-	if q == "" {
-		a.searchModel.SetHits(nil)
-		a.searchInfo.SetText("输入关键字后点击「搜索」（只查本地缓存，忽略大小写）")
-		return
-	}
-
-	hits, err := a.cache.Search(q, 500)
-	if err != nil {
-		a.logf("本地搜索失败：%v", err)
-		a.searchInfo.SetText("搜索失败：" + err.Error())
-		return
-	}
-
-	a.searchModel.SetHits(hits)
-
-	msg := fmt.Sprintf("搜索「%s」：%d 条结果（仅本地缓存）", q, len(hits))
-	if len(hits) == 0 {
-		msg = fmt.Sprintf("搜索「%s」：本地缓存中没有匹配项", q)
-	}
-	a.searchInfo.SetText(msg)
-	if announce {
-		a.logf("%s", msg)
-	}
-}
-
-func (a *App) onSearchActivated() {
-	if a.searchTable == nil || a.searchModel == nil {
-		return
-	}
-	hit, ok := a.searchModel.Hit(a.searchTable.CurrentIndex())
-	if !ok {
-		return
-	}
-	a.revealHit(hit)
-}
-
-// revealHit 用本地缓存逐级展开目录树并选中目标（不访问网络）。
-func (a *App) revealHit(hit store.SearchHit) {
-	entries, ok := a.cache.Children("/")
-	if !ok {
-		walk.MsgBox(a.mw, "无法定位", "根目录还没有本地缓存。", walk.MsgBoxIconInformation)
-		return
-	}
-	a.model.ApplyFolder(a.root, entries)
-	_ = a.tv.SetExpanded(a.root, true)
-
-	rel := strings.Trim(strings.TrimPrefix(store.NormalizePath(hit.Path), "/"), "/")
-	if rel == "" {
-		a.showTree()
-		_ = a.tv.SetCurrentItem(a.root)
-		_ = a.tv.EnsureVisible(a.root)
-		return
-	}
-
-	node := a.root
-	for _, seg := range strings.Split(rel, "/") {
-		var next *Node
-		for _, c := range node.children {
-			if c.placeholder {
-				continue
-			}
-			if c.entry.Name == seg {
-				next = c
-				break
-			}
-		}
-		if next == nil {
-			walk.MsgBox(a.mw, "无法定位", "该条目的上级目录尚未同步到本地："+node.DisplayPath(), walk.MsgBoxIconInformation)
-			return
-		}
-
-		node = next
-		if !next.IsDir() {
-			break
-		}
-
-		// 只从本地缓存展开，避免触发网络同步。
-		children, cached := a.cache.Children(next.Path())
-		if !cached {
-			break
-		}
-		a.model.ApplyFolder(next, children)
-		_ = a.tv.SetExpanded(next, true)
-	}
-
-	a.showTree()
-	_ = a.tv.SetCurrentItem(node)
-	_ = a.tv.EnsureVisible(node)
-	a.setInfo(fmt.Sprintf("已定位：%s", node.DisplayPath()))
-}
-
-// UI 线程/状态辅助
-//
-
-// postUI 把函数投递到 UI 线程执行。
-func (a *App) postUI(f func()) {
-	if a.closed.Load() || a.mw == nil {
-		return
-	}
-	a.mw.Synchronize(func() {
-		if a.closed.Load() {
-			return
-		}
-		f()
-	})
-}
-
-func (a *App) setInfo(text string) {
-	a.postUI(func() {
-		if a.infoItem != nil {
-			a.infoItem.SetText(text)
-		}
-	})
-}
-
-func (a *App) setStatus(text string) {
-	a.postUI(func() {
-		if a.statusItem != nil {
-			a.statusItem.SetText(text)
-		}
-	})
-}
-
-// statusf 带格式化的状态栏更新。
-func (a *App) statusf(format string, args ...any) {
-	a.setStatus(fmt.Sprintf(format, args...))
-}
-
-func (a *App) setBusy(busy bool) {
-	a.postUI(func() {
-		if a.stopBtn != nil {
-			a.stopBtn.SetEnabled(busy)
-		}
-		if a.syncBtn != nil {
-			a.syncBtn.SetEnabled(!busy)
-		}
-		if a.syncAllBtn != nil {
-			a.syncAllBtn.SetEnabled(!busy)
-		}
-		if a.settingsBtn != nil {
-			a.settingsBtn.SetEnabled(!busy)
-		}
-		if !busy && a.statusItem != nil {
-			a.statusItem.SetText("就绪")
-		}
-	})
-}
-
+// logf 可在任意 goroutine 调用。
 func (a *App) logf(format string, args ...any) {
-	line := time.Now().Format("15:04:05") + "  " + fmt.Sprintf(format, args...)
-	log.Print(line)
+	msg := format
+	if len(args) > 0 {
+		msg = fmt.Sprintf(format, args...)
+	}
+	log.Print(msg)
+	a.async(func() { a.addLog("%s", msg) })
+}
 
-	a.postUI(func() {
-		if a.logEdit == nil {
-			return
-		}
-		a.logEdit.AppendText(line + "\r\n")
-		a.logLines++
-		if a.logLines > 5000 {
-			lines := strings.Split(a.logEdit.Text(), "\r\n")
-			if len(lines) > 2500 {
-				lines = lines[len(lines)-2500:]
-			}
-			a.logEdit.SetText(strings.Join(lines, "\r\n"))
-			a.logLines = len(lines)
-		}
-		a.logEdit.ScrollToCaret()
-	})
+// addLog 只能在主线程调用（视图、动作或 async 内）。
+func (a *App) addLog(format string, args ...any) {
+	line := time.Now().Format("15:04:05") + "  " + fmt.Sprintf(format, args...)
+	a.logs = append(a.logs, line)
+	if len(a.logs) > 3000 {
+		a.logs = a.logs[len(a.logs)-3000:]
+	}
+}
+
+// 供 settings.go 使用
+func (a *App) parseQPS(s string) (float64, bool) {
+	v, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+	if err != nil || v <= 0 {
+		return 0, false
+	}
+	return v, true
 }

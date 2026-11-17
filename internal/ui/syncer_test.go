@@ -14,30 +14,24 @@ import (
 	"pan123/internal/webdav"
 )
 
-// fakeDAV 是一个极简的 WebDAV 服务：按路径返回 PROPFIND 207 响应。
+// fakeDAV 是极简 WebDAV 服务：按路径返回 PROPFIND 207 响应。
 type fakeDAV struct {
 	baseURL string
 
 	mu     sync.Mutex
 	tree   map[string][]store.Entry
 	calls  map[string]int
-	status int            // 非 0 时所有请求直接返回该状态码
-	fail   map[string]int // 指定目录强制返回某个状态码（模拟单个目录失效）
+	status int
+	fail   map[string]int
 }
 
 func newFakeDAV(t *testing.T, tree map[string][]store.Entry) *fakeDAV {
 	t.Helper()
 
-	f := &fakeDAV{
-		tree:  tree,
-		calls: make(map[string]int),
-		fail:  make(map[string]int),
-	}
-
+	f := &fakeDAV{tree: tree, calls: make(map[string]int), fail: make(map[string]int)}
 	srv := httptest.NewServer(http.HandlerFunc(f.handle))
 	t.Cleanup(srv.Close)
 	f.baseURL = srv.URL + "/dav"
-
 	return f
 }
 
@@ -65,8 +59,6 @@ func (f *fakeDAV) handle(w http.ResponseWriter, r *http.Request) {
 
 	var b strings.Builder
 	b.WriteString(`<?xml version="1.0" encoding="utf-8"?><D:multistatus xmlns:D="DAV:">`)
-
-	// 目录自身
 	fmt.Fprintf(&b, `<D:response><D:href>%s</D:href><D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>`,
 		xmlEscape(davHref("/dav", dir, "", true)))
 
@@ -86,7 +78,6 @@ func (f *fakeDAV) handle(w http.ResponseWriter, r *http.Request) {
 		}
 		b.WriteString(`</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>`)
 	}
-
 	b.WriteString(`</D:multistatus>`)
 
 	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
@@ -110,7 +101,6 @@ func (f *fakeDAV) totalCalls() int {
 	return n
 }
 
-// davHref 拼出 WebDAV 响应里的 href（各段做 URL 转义）。
 func davHref(base, dir, name string, isDir bool) string {
 	segs := []string{strings.Trim(base, "/")}
 	if d := strings.Trim(dir, "/"); d != "" {
@@ -133,7 +123,7 @@ func xmlEscape(s string) string {
 	return strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&#34;").Replace(s)
 }
 
-func newTestSyncer(t *testing.T, f *fakeDAV) (*Syncer, *store.Cache, *TreeModel, *Node) {
+func newTestSyncer(t *testing.T, f *fakeDAV) (*Syncer, *store.Cache, *Node) {
 	t.Helper()
 
 	cache, err := store.Open(filepath.Join(t.TempDir(), "tree.db"))
@@ -143,20 +133,25 @@ func newTestSyncer(t *testing.T, f *fakeDAV) (*Syncer, *store.Cache, *TreeModel,
 	t.Cleanup(func() { cache.Close() })
 
 	client := webdav.New(webdav.Options{BaseURL: f.baseURL, QPS: 1000})
-
 	root := NewRootNode()
-	model := NewTreeModel(root)
 
 	s := NewSyncer(client, cache)
-	s.apply = func(n *Node, entries []store.Entry) { model.ApplyFolder(n, entries) }
+	// 测试里没有窗口主线程，直接同步调用。
+	s.synchronize = nil
+	s.apply = func(n *Node, entries []store.Entry) {
+		n.mergeChildren(entries)
+		n.loaded = true
+		n.loading = false
+		n.loadFailed = false
+	}
 	s.logf = func(format string, args ...any) {}
 	s.status = func(string) {}
 	s.busy = func(bool) {}
 
-	return s, cache, model, root
+	return s, cache, root
 }
 
-// TestSyncerRecursive 验证「选中目录 -> 递归同步 -> 写入 SQLite -> 更新树」的完整流程。
+// TestSyncerRecursive 验证「递归同步 -> 写入 SQLite -> 更新树模型」。
 func TestSyncerRecursive(t *testing.T) {
 	f := newFakeDAV(t, map[string][]store.Entry{
 		"/": {
@@ -170,7 +165,7 @@ func TestSyncerRecursive(t *testing.T) {
 		"/电影/2024": {},
 	})
 
-	s, cache, _, root := newTestSyncer(t, f)
+	s, cache, root := newTestSyncer(t, f)
 	s.process(&Job{Node: root, Recursive: true})
 
 	for _, dir := range []string{"/", "/电影", "/电影/2024"} {
@@ -178,95 +173,74 @@ func TestSyncerRecursive(t *testing.T) {
 			t.Fatalf("calls[%s] = %d, want 1", dir, got)
 		}
 	}
-
-	if got := root.ChildCount(); got != 2 {
-		t.Fatalf("root children = %d, want 2", got)
+	if !root.Loaded() || len(root.Children()) != 2 {
+		t.Fatalf("root loaded=%v children=%d", root.Loaded(), len(root.Children()))
 	}
-	if !root.Loaded() {
-		t.Fatal("root should be loaded")
-	}
-
-	dir := root.children[0]
-	if !dir.IsDir() || !dir.Loaded() || dir.ChildCount() != 2 {
+	dir := root.find("/电影")
+	if dir == nil || !dir.Loaded() || len(dir.Children()) != 2 {
 		t.Fatalf("dir = %+v", dir)
 	}
-	if dir.Path() != "/电影" {
-		t.Fatalf("dir path = %q", dir.Path())
-	}
-
-	year := dir.children[0]
-	if year.Path() != "/电影/2024" || !year.Loaded() || year.ChildCount() != 0 {
+	year := root.find("/电影/2024")
+	if year == nil || !year.Loaded() || len(year.Children()) != 0 {
 		t.Fatalf("year = %+v", year)
 	}
 
-	// SQLite 缓存已写入，且空目录也标记为已同步。
 	if entries, ok := cache.Children("/"); !ok || len(entries) != 2 {
 		t.Fatalf("cache root = %v, ok=%v", entries, ok)
-	}
-	if entries, ok := cache.Children("/电影"); !ok || len(entries) != 2 {
-		t.Fatalf("cache dir = %v, ok=%v", entries, ok)
 	}
 	if entries, ok := cache.Children("/电影/2024"); !ok || len(entries) != 0 {
 		t.Fatalf("cache empty dir = %v, ok=%v", entries, ok)
 	}
 }
 
-// TestSyncSelectedOnlyOneLevel 验证「不包含子目录」时只请求一层。
-func TestSyncSelectedOnlyOneLevel(t *testing.T) {
+// TestSyncOneLevel 验证「仅本层」只请求一次。
+func TestSyncOneLevel(t *testing.T) {
 	f := newFakeDAV(t, map[string][]store.Entry{
 		"/": {{Name: "dir", IsDir: true}, {Name: "f.txt", Size: 1}},
 	})
-
-	s, _, _, root := newTestSyncer(t, f)
+	s, _, root := newTestSyncer(t, f)
 	s.process(&Job{Node: root, Recursive: false})
 
 	if got := f.totalCalls(); got != 1 {
 		t.Fatalf("calls = %d, want 1", got)
 	}
-	if root.ChildCount() != 2 {
-		t.Fatalf("root children = %d", root.ChildCount())
+	dir := root.find("/dir")
+	if dir == nil || dir.Loaded() {
+		t.Fatalf("dir should stay unloaded: %+v", dir)
 	}
-	dir := root.children[0]
-	if dir.Loaded() {
-		t.Fatal("sub dir should stay unloaded when not recursive")
-	}
-	if !dir.HasChild() {
-		t.Fatal("unloaded dir should report HasChild() == true")
+	if got := dir.outlineChildren(); got == nil {
+		t.Fatal("unloaded dir should show an expander")
 	}
 }
 
-// TestSyncerAuthErrorKeepsCache 验证鉴权失败时不会写入缓存。
-func TestSyncerAuthErrorKeepsCache(t *testing.T) {
+// TestSyncerAuthError 验证鉴权失败时不写入缓存、不标记已加载。
+func TestSyncerAuthError(t *testing.T) {
 	f := newFakeDAV(t, map[string][]store.Entry{"/": {{Name: "x"}}})
 	f.status = http.StatusUnauthorized
 
-	s, cache, _, root := newTestSyncer(t, f)
+	s, cache, root := newTestSyncer(t, f)
 	s.process(&Job{Node: root, Recursive: true})
 
 	if _, ok := cache.Children("/"); ok {
 		t.Fatal("cache should not be written on auth error")
 	}
 	if root.Loaded() {
-		t.Fatal("root should not be marked loaded on auth error")
+		t.Fatal("root should not be loaded on auth error")
 	}
 }
 
-// TestSyncerOneFolderFailsKeepsGoing 验证单个目录 404 不会中断整体同步。
-func TestSyncerOneFolderFailsKeepsGoing(t *testing.T) {
+// TestSyncerOneFolderFails 验证单个目录 404 不影响其它目录。
+func TestSyncerOneFolderFails(t *testing.T) {
 	f := newFakeDAV(t, map[string][]store.Entry{
-		"/": {
-			{Name: "ok", IsDir: true},
-			{Name: "bad", IsDir: true},
-			{Name: "f.txt", Size: 1},
-		},
+		"/":   {{Name: "ok", IsDir: true}, {Name: "bad", IsDir: true}},
 		"/ok": {{Name: "inner.txt"}},
 	})
 	f.fail["/bad"] = http.StatusNotFound
 
-	s, cache, _, root := newTestSyncer(t, f)
+	s, cache, root := newTestSyncer(t, f)
 	s.process(&Job{Node: root, Recursive: true})
 
-	if entries, ok := cache.Children("/"); !ok || len(entries) != 3 {
+	if entries, ok := cache.Children("/"); !ok || len(entries) != 2 {
 		t.Fatalf("cache root = %v, ok=%v", entries, ok)
 	}
 	if entries, ok := cache.Children("/ok"); !ok || len(entries) != 1 {
@@ -275,27 +249,9 @@ func TestSyncerOneFolderFailsKeepsGoing(t *testing.T) {
 	if _, ok := cache.Children("/bad"); ok {
 		t.Fatal("failed folder must not be cached")
 	}
-
-	okDir := childByName(root, "ok")
-	badDir := childByName(root, "bad")
-	if okDir == nil || badDir == nil {
-		t.Fatalf("children = %v", root.children)
-	}
-	if !okDir.Loaded() || okDir.ChildCount() != 1 {
-		t.Fatalf("ok dir = %+v", okDir)
-	}
-	if badDir.Loaded() {
+	if bad := root.find("/bad"); bad == nil || bad.Loaded() {
 		t.Fatal("failed dir should stay unloaded")
 	}
-}
-
-func childByName(n *Node, name string) *Node {
-	for _, c := range n.children {
-		if c.entry.Name == name {
-			return c
-		}
-	}
-	return nil
 }
 
 func TestFormatSize(t *testing.T) {
@@ -311,5 +267,14 @@ func TestFormatSize(t *testing.T) {
 		if got := FormatSize(in); got != want {
 			t.Fatalf("FormatSize(%d) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestDisplayDir(t *testing.T) {
+	if got := displayDir("/"); got != "我的云盘" {
+		t.Fatalf("displayDir(/) = %q", got)
+	}
+	if got := displayDir("电影/2024"); got != "我的云盘/电影/2024" {
+		t.Fatalf("displayDir = %q", got)
 	}
 }

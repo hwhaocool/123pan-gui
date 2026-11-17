@@ -25,13 +25,13 @@ type Syncer struct {
 	client *webdav.Client
 	cache  *store.Cache
 
-	// 由 App 注入。
-	synchronize func(func())                     // 投递到 UI 线程（异步）
-	apply       func(*Node, []store.Entry)       // 在 UI 线程更新树模型
-	logf        func(format string, args ...any) // 写日志
-	status      func(string)                     // 更新状态栏
-	busy        func(bool)                       // 更新按钮可用状态
-	done        func(*Node)                      // 一个任务结束时回调（用于展开节点）
+	// 由 App 注入；synchronize 用于把「更新树模型」放到主线程同步执行。
+	synchronize func(func())
+	apply       func(*Node, []store.Entry)
+	logf        func(format string, args ...any)
+	status      func(string)
+	busy        func(bool)
+	done        func(*Node)
 
 	mu      sync.Mutex
 	queue   []*Job
@@ -53,9 +53,7 @@ func NewSyncer(client *webdav.Client, cache *store.Cache) *Syncer {
 }
 
 // Start 启动后台 worker。
-func (s *Syncer) Start() {
-	go s.run()
-}
+func (s *Syncer) Start() { go s.run() }
 
 // Busy 表示是否正在同步。
 func (s *Syncer) Busy() bool {
@@ -230,7 +228,7 @@ func (s *Syncer) process(job *Job) {
 		}
 
 		cached, _ := s.cache.Children(cur.Path())
-		// 在 UI 线程同步更新模型，保证下面 ChildDirs() 读到的是最新数据。
+		// 在主线程同步更新树模型，保证下面 ChildDirs 读到最新数据。
 		s.callUI(func() { s.apply(cur, cached) })
 
 		folders++
@@ -242,9 +240,10 @@ func (s *Syncer) process(job *Job) {
 		}
 
 		if recursive {
-			dirs := cur.ChildDirs()
-			for i := len(dirs) - 1; i >= 0; i-- {
-				stack = append(stack, dirs[i])
+			for i := len(cur.children) - 1; i >= 0; i-- {
+				if c := cur.children[i]; c.IsDir() {
+					stack = append(stack, c)
+				}
 			}
 		}
 	}
@@ -270,13 +269,6 @@ func (s *Syncer) callUI(f func()) {
 
 func (s *Syncer) flush() {
 	if err := s.cache.Flush(); err != nil {
-		s.logf("合并本地数据库失败：%v", err)
+		s.logf("优化本地数据库失败：%v", err)
 	}
-}
-
-func onOff(b bool, yes, no string) string {
-	if b {
-		return yes
-	}
-	return no
 }
