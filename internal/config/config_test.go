@@ -23,6 +23,14 @@ func TestConfigPathInWorkDir(t *testing.T) {
 	if !strings.EqualFold(filepath.Clean(path), filepath.Clean(filepath.Join(dir, ConfigFileName))) {
 		t.Fatalf("config path = %q, want it under %q", path, dir)
 	}
+
+	cachePath, err := CachePath()
+	if err != nil {
+		t.Fatalf("CachePath: %v", err)
+	}
+	if !strings.EqualFold(filepath.Clean(cachePath), filepath.Clean(filepath.Join(dir, CacheFileName))) {
+		t.Fatalf("cache path = %q, want it under %q", cachePath, dir)
+	}
 }
 
 // TestLoadDefaultsAndRoundTrip 验证默认配置与保存/读取。

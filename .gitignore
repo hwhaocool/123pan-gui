@@ -5,6 +5,7 @@ rsrc.syso
 # 本地配置（含 access_token / clientID / clientSecret，切勿提交）
 /config.json
 /tree.json
+/tree.json.bad
 config.json.tmp
 
 # 本地运行日志

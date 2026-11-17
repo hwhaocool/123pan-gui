@@ -1,7 +1,7 @@
 // Package config 负责配置文件与本地缓存目录。
 //
-//   - config.json 保存在「程序当前工作目录」（通常就是 exe 所在目录），方便查看/携带；
-//   - 目录树缓存较大且属于可再生成的数据，仍放在 %APPDATA%\123pan-client。
+// config.json 和 tree.json 都保存在「程序当前工作目录」（通常就是 exe 所在目录），
+// 整个程序目录可以直接拷贝带走，方便个人使用。
 package config
 
 import (
@@ -88,21 +88,9 @@ func ConfigPath() (string, error) {
 	return filepath.Join(d, ConfigFileName), nil
 }
 
-// AppDataDir 返回缓存目录（%APPDATA%\123pan-client）。
-func AppDataDir() (string, error) {
-	if d := os.Getenv("APPDATA"); d != "" {
-		return filepath.Join(d, "123pan-client"), nil
-	}
-	d, err := os.UserConfigDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(d, "123pan-client"), nil
-}
-
-// CachePath 返回目录树缓存文件路径。
+// CachePath 返回目录树缓存文件路径（当前工作目录下的 tree.json）。
 func CachePath() (string, error) {
-	d, err := AppDataDir()
+	d, err := WorkDir()
 	if err != nil {
 		return "", err
 	}
