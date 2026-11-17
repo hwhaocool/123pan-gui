@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS entry (
 );
 
 CREATE INDEX IF NOT EXISTS idx_entry_parent ON entry(parent);
+CREATE INDEX IF NOT EXISTS idx_entry_sort_name ON entry(sort_name);
 `
 
 // Cache 是 SQLite 目录树缓存，可安全地被多个 goroutine 使用。
@@ -521,6 +522,83 @@ func (c *Cache) Search(query string, limit int) ([]SearchHit, error) {
 		hits = hits[:limit]
 	}
 	return hits, nil
+}
+
+// DuplicateGroup 是一组在本地缓存中同名（忽略大小写）的文件。
+type DuplicateGroup struct {
+	Name  string      // 展示用的文件名（取组内第一个文件的名字）
+	Files []SearchHit // 同名文件，按路径升序
+}
+
+// DuplicateFiles 在本地 SQLite 缓存里查找同名文件（只统计文件，不统计文件夹）。
+//
+//   - 同名判断忽略大小写（基于 sort_name，同 Search）；
+//   - min 为至少几个文件才算重复，小于 2 时按 2 处理；
+//   - limit 限制返回的组数（<=0 或过大时按 500 处理）；
+//   - 结果按文件名升序，组内文件按路径升序；
+//   - 不会访问网络。
+func (c *Cache) DuplicateFiles(min, limit int) ([]DuplicateGroup, error) {
+	if min < 2 {
+		min = 2
+	}
+	if limit <= 0 || limit > 2000 {
+		limit = 500
+	}
+
+	// 先挑出有多个同名文件的 sort_name（受 limit 限制），再一次性取回这些名字的全部文件。
+	const q = `
+		WITH dup(sort_name) AS (
+			SELECT sort_name FROM entry
+			WHERE is_dir = 0
+			GROUP BY sort_name
+			HAVING COUNT(1) >= ?
+			ORDER BY sort_name ASC
+			LIMIT ?
+		)
+		SELECT e.parent, e.name, e.size, e.etag, e.created, e.modified, e.content_type
+		FROM entry e
+		JOIN dup ON e.sort_name = dup.sort_name
+		WHERE e.is_dir = 0
+		ORDER BY e.sort_name ASC, e.parent ASC, e.name ASC`
+
+	rows, err := c.db.Query(q, min, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	groups := make([]DuplicateGroup, 0, 16)
+	current := ""
+	for rows.Next() {
+		var (
+			h                 SearchHit
+			created, modified int64
+		)
+		if err := rows.Scan(&h.Parent, &h.Name, &h.Size, &h.ETag, &created, &modified, &h.ContentType); err != nil {
+			return nil, err
+		}
+		if created > 0 {
+			h.Created = time.Unix(0, created)
+		}
+		if modified > 0 {
+			h.Modified = time.Unix(0, modified)
+		}
+		h.Parent = NormalizePath(h.Parent)
+		h.Path = entryPath(h.Parent, h.Name)
+
+		key := strings.ToLower(h.Name)
+		if len(groups) == 0 || key != current {
+			groups = append(groups, DuplicateGroup{Name: h.Name})
+			current = key
+		}
+		last := &groups[len(groups)-1]
+		last.Files = append(last.Files, h)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return groups, nil
 }
 
 // matchRank 给搜索结果打相关度：0 完全相同，1 前缀匹配，2 包含，3 其它（多关键字）。

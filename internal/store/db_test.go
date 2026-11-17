@@ -503,3 +503,108 @@ func TestDeleteEntryAndSubtree(t *testing.T) {
 		t.Fatal("deleting root cache should fail")
 	}
 }
+
+// TestDuplicateFiles 验证同名文件检测：忽略大小写、只统计文件、按名字分组。
+func TestDuplicateFiles(t *testing.T) {
+	c, err := Open(filepath.Join(t.TempDir(), "tree.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { c.Close() })
+
+	created := time.Date(2025, 1, 2, 3, 4, 5, 0, time.UTC)
+	modified := time.Date(2025, 6, 7, 8, 9, 10, 0, time.UTC)
+
+	if err := c.SetFolder("/", []Entry{
+		{Name: "a.txt", Size: 100, Created: created, Modified: modified},
+		{Name: "only.txt", Size: 1},
+		{Name: "Same.txt", Size: 2},
+		{Name: "docs", IsDir: true},
+	}); err != nil {
+		t.Fatalf("SetFolder /: %v", err)
+	}
+	if err := c.SetFolder("/docs", []Entry{
+		{Name: "a.txt", Size: 200},
+		{Name: "same.TXT", Size: 3},
+		{Name: "another", IsDir: true},
+	}); err != nil {
+		t.Fatalf("SetFolder /docs: %v", err)
+	}
+	// 与 "/docs" 同名的文件夹不算重复；文件夹里的 a.txt 仍要参与统计。
+	if err := c.SetFolder("/other", []Entry{
+		{Name: "docs", IsDir: true},
+		{Name: "a.txt", Size: 300},
+	}); err != nil {
+		t.Fatalf("SetFolder /other: %v", err)
+	}
+	if err := c.SetFolder("/other/docs", []Entry{
+		{Name: "same.txt", Size: 4},
+	}); err != nil {
+		t.Fatalf("SetFolder /other/docs: %v", err)
+	}
+
+	groups, err := c.DuplicateFiles(2, 100)
+	if err != nil {
+		t.Fatalf("DuplicateFiles: %v", err)
+	}
+	if len(groups) != 2 {
+		t.Fatalf("groups = %d, want 2 (%+v)", len(groups), groups)
+	}
+
+	a := groups[0]
+	if a.Name != "a.txt" || len(a.Files) != 3 {
+		t.Fatalf("group 0 = %+v", a)
+	}
+	if got, want := hitNames(a.Files), []string{"/a.txt", "/docs/a.txt", "/other/a.txt"}; !equalStrings(got, want) {
+		t.Fatalf("group 0 files = %v, want %v", got, want)
+	}
+	if a.Files[0].Parent != "/" || a.Files[1].Parent != "/docs" {
+		t.Fatalf("group 0 parents = %+v", a.Files)
+	}
+	if !a.Files[0].Created.Equal(created) || !a.Files[0].Modified.Equal(modified) || a.Files[0].Size != 100 {
+		t.Fatalf("group 0 first file = %+v", a.Files[0])
+	}
+
+	// 大小写不同的同名文件归到一组，组名取第一次遇到的名字。
+	same := groups[1]
+	if len(same.Files) != 3 {
+		t.Fatalf("group 1 = %+v", same)
+	}
+	names := make(map[string]bool, 3)
+	for _, f := range same.Files {
+		names[f.Name] = true
+	}
+	if !names["Same.txt"] || !names["same.TXT"] || !names["same.txt"] {
+		t.Fatalf("group 1 names = %v", names)
+	}
+
+	// min 大于组内文件数时不应返回结果。
+	groups, err = c.DuplicateFiles(4, 100)
+	if err != nil {
+		t.Fatalf("DuplicateFiles(min=4): %v", err)
+	}
+	if len(groups) != 0 {
+		t.Fatalf("groups = %+v, want none", groups)
+	}
+
+	// limit 限制组数。
+	groups, err = c.DuplicateFiles(2, 1)
+	if err != nil {
+		t.Fatalf("DuplicateFiles(limit=1): %v", err)
+	}
+	if len(groups) != 1 {
+		t.Fatalf("groups = %+v, want 1", groups)
+	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}

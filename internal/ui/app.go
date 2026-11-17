@@ -60,6 +60,15 @@ type App struct {
 	searchSelected int
 	showResults    bool
 
+	showDupes       bool
+	dupGroups       []store.DuplicateGroup
+	dupList         ui.ListState
+	dupSelected     int
+	dupFileList     ui.ListState
+	dupFileSelected int
+	dupShownGroup   int
+	dupWidth        float32
+
 	settingsOpen    bool
 	draft           settingsDraft
 	settingsStatus  string
@@ -78,13 +87,17 @@ type App struct {
 // 初始化失败时返回带 initErr 的 App，界面会显示错误信息。
 func NewApp() *App {
 	a := &App{
-		status:         "就绪",
-		includeSubdirs: true,
-		topPercent:     74,
-		leftWidth:      320,
-		fileSelected:   -1,
-		selectedRow:    -1,
-		searchSelected: -1,
+		status:          "就绪",
+		includeSubdirs:  true,
+		topPercent:      74,
+		leftWidth:       320,
+		fileSelected:    -1,
+		selectedRow:     -1,
+		searchSelected:  -1,
+		dupSelected:     -1,
+		dupFileSelected: -1,
+		dupShownGroup:   -1,
+		dupWidth:        260,
 	}
 
 	cfg, path, err := config.Load()
@@ -228,6 +241,9 @@ func (a *App) toolbar(c *ui.Context) {
 			a.status = "正在停止…"
 		})
 		ui.Checkbox(c, &a.includeSubdirs, "包含子目录")
+		ui.Button(c, "重复文件检测").
+			Tooltip("在本地缓存中查找同名文件（不含文件夹）").
+			OnClick(a.detectDuplicates)
 
 		ui.Spacer(c)
 
@@ -237,9 +253,10 @@ func (a *App) toolbar(c *ui.Context) {
 			Changed() {
 			a.runSearch(false)
 		}
-		if a.showResults {
+		if a.showResults || a.showDupes {
 			if ui.Button(c, "返回目录树").Clicked() {
 				a.showResults = false
+				a.showDupes = false
 			}
 		} else if strings.TrimSpace(a.searchQuery) != "" {
 			if ui.Button(c, "查看搜索结果").Clicked() {
@@ -252,6 +269,10 @@ func (a *App) toolbar(c *ui.Context) {
 
 func (a *App) body(c *ui.Context, t *ui.Theme) {
 	ui.SplitVerticalPercent(c, &a.topPercent, func() {
+		if a.showDupes {
+			a.duplicatesView(c, t)
+			return
+		}
 		if a.showResults {
 			a.resultsView(c, t)
 			return
@@ -434,6 +455,7 @@ func (a *App) navigateTo(n *Node) {
 		a.outline.Open.Add(p)
 	}
 	a.showResults = false
+	a.showDupes = false
 	a.pendingReveal = n
 	a.pendingFile = ""
 	a.fileShownDir = ""
@@ -770,6 +792,7 @@ func (a *App) runSearch(announce bool) {
 	a.searchResults = hits
 	a.searchSelected = -1
 	a.showResults = true
+	a.showDupes = false
 	if announce {
 		if len(hits) == 0 {
 			a.addLog("搜索「%s」：本地缓存中没有匹配项", q)
@@ -830,6 +853,7 @@ func (a *App) reveal(hit store.SearchHit) {
 	}
 
 	a.showResults = false
+	a.showDupes = false
 	a.pendingReveal = target
 	a.status = "已定位：" + node.DisplayPath()
 }
