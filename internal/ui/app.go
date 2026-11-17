@@ -40,6 +40,12 @@ type App struct {
 	settingsBtn *walk.PushButton
 	subdirs     *walk.CheckBox
 
+	tabs        *walk.TabWidget
+	searchEdit  *walk.LineEdit
+	searchTable *walk.TableView
+	searchInfo  *walk.Label
+	searchModel *searchModel
+
 	closed   atomic.Bool
 	logLines int
 }
@@ -96,6 +102,7 @@ func (a *App) init() error {
 
 	a.root = NewRootNode()
 	a.model = NewTreeModel(a.root)
+	a.searchModel = &searchModel{}
 
 	a.client = webdav.New(a.clientOptions())
 	a.client.OnWait = func(d time.Duration) {
@@ -119,6 +126,11 @@ func (a *App) init() error {
 		a.postUI(func() {
 			if a.tv != nil {
 				_ = a.tv.SetExpanded(n, true)
+			}
+			// 搜索结果来自本地缓存，同步完成后顺手刷新一下当前结果。
+			if a.tabs != nil && a.tabs.CurrentIndex() == 1 && a.searchEdit != nil &&
+				strings.TrimSpace(a.searchEdit.Text()) != "" {
+				a.performSearch(false)
 			}
 		})
 	}
@@ -184,15 +196,77 @@ func (a *App) build() error {
 					},
 				},
 			},
+			Composite{
+				Layout: HBox{
+					Margins: Margins{Left: 8, Top: 0, Right: 8, Bottom: 6},
+					Spacing: 6,
+				},
+				Children: []Widget{
+					Label{Text: "搜索（仅本地缓存）：", MinSize: Size{130, 0}},
+					LineEdit{
+						AssignTo:      &a.searchEdit,
+						MinSize:       Size{200, 0},
+						StretchFactor: 1,
+						OnKeyDown:     a.onSearchKeyDown,
+					},
+					PushButton{Text: "搜索", MinSize: Size{70, 0}, OnClicked: a.onSearch},
+					PushButton{Text: "清除", MinSize: Size{70, 0}, OnClicked: a.onClearSearch},
+				},
+			},
 			VSplitter{
 				Children: []Widget{
-					TreeView{
-						AssignTo:             &a.tv,
-						Model:                a.model,
-						MinSize:              Size{0, 220},
-						OnExpandedChanged:    a.onExpanded,
-						OnCurrentItemChanged: a.onSelectionChanged,
-						OnItemActivated:      a.onItemActivated,
+					TabWidget{
+						AssignTo: &a.tabs,
+						MinSize:  Size{0, 220},
+						Pages: []TabPage{
+							{
+								Title:  "目录树",
+								Layout: VBox{MarginsZero: true},
+								Children: []Widget{
+									TreeView{
+										AssignTo:             &a.tv,
+										Model:                a.model,
+										OnExpandedChanged:    a.onExpanded,
+										OnCurrentItemChanged: a.onSelectionChanged,
+										OnItemActivated:      a.onItemActivated,
+									},
+								},
+							},
+							{
+								Title:  "搜索结果",
+								Layout: VBox{Margins: Margins{Left: 6, Top: 6, Right: 6, Bottom: 6}, Spacing: 4},
+								Children: []Widget{
+									Composite{
+										Layout: HBox{Spacing: 6},
+										Children: []Widget{
+											Label{
+												AssignTo: &a.searchInfo,
+												Text:     "输入关键字后点击「搜索」（只查本地缓存，忽略大小写）",
+											},
+											HSpacer{},
+											PushButton{
+												Text:      "返回目录树",
+												MinSize:   Size{90, 0},
+												OnClicked: func() { a.showTree() },
+											},
+										},
+									},
+									TableView{
+										AssignTo:         &a.searchTable,
+										Model:            a.searchModel,
+										StretchFactor:    1,
+										ColumnsOrderable: true,
+										OnItemActivated:  a.onSearchActivated,
+										Columns: []TableViewColumn{
+											{Title: "名称", Width: 300},
+											{Title: "类型", Width: 80},
+											{Title: "大小", Width: 100, Alignment: AlignFar},
+											{Title: "位置", Width: 360},
+										},
+									},
+								},
+							},
+						},
 					},
 					TextEdit{
 						AssignTo: &a.logEdit,
@@ -411,6 +485,142 @@ func (a *App) onSelectionChanged() {
 }
 
 //
+// 搜索（只查本地 SQLite 缓存，不访问网络）
+//
+
+func (a *App) onSearchKeyDown(key walk.Key) {
+	if key == walk.KeyReturn {
+		a.onSearch()
+	}
+}
+
+func (a *App) onSearch() {
+	if a.searchEdit == nil {
+		return
+	}
+	a.performSearch(true)
+	if a.tabs != nil {
+		_ = a.tabs.SetCurrentIndex(1)
+	}
+}
+
+func (a *App) onClearSearch() {
+	if a.searchEdit != nil {
+		a.searchEdit.SetText("")
+	}
+	if a.searchModel != nil {
+		a.searchModel.SetHits(nil)
+	}
+	if a.searchInfo != nil {
+		a.searchInfo.SetText("输入关键字后点击「搜索」（只查本地缓存，忽略大小写）")
+	}
+	a.showTree()
+}
+
+func (a *App) showTree() {
+	if a.tabs != nil {
+		_ = a.tabs.SetCurrentIndex(0)
+	}
+}
+
+// performSearch 在本地缓存中做模糊搜索；announce 为 true 时写一条日志。
+func (a *App) performSearch(announce bool) {
+	if a.searchEdit == nil || a.searchModel == nil || a.searchInfo == nil {
+		return
+	}
+
+	q := strings.TrimSpace(a.searchEdit.Text())
+	if q == "" {
+		a.searchModel.SetHits(nil)
+		a.searchInfo.SetText("输入关键字后点击「搜索」（只查本地缓存，忽略大小写）")
+		return
+	}
+
+	hits, err := a.cache.Search(q, 500)
+	if err != nil {
+		a.logf("本地搜索失败：%v", err)
+		a.searchInfo.SetText("搜索失败：" + err.Error())
+		return
+	}
+
+	a.searchModel.SetHits(hits)
+
+	msg := fmt.Sprintf("搜索「%s」：%d 条结果（仅本地缓存）", q, len(hits))
+	if len(hits) == 0 {
+		msg = fmt.Sprintf("搜索「%s」：本地缓存中没有匹配项", q)
+	}
+	a.searchInfo.SetText(msg)
+	if announce {
+		a.logf("%s", msg)
+	}
+}
+
+func (a *App) onSearchActivated() {
+	if a.searchTable == nil || a.searchModel == nil {
+		return
+	}
+	hit, ok := a.searchModel.Hit(a.searchTable.CurrentIndex())
+	if !ok {
+		return
+	}
+	a.revealHit(hit)
+}
+
+// revealHit 用本地缓存逐级展开目录树并选中目标（不访问网络）。
+func (a *App) revealHit(hit store.SearchHit) {
+	entries, ok := a.cache.Children("/")
+	if !ok {
+		walk.MsgBox(a.mw, "无法定位", "根目录还没有本地缓存。", walk.MsgBoxIconInformation)
+		return
+	}
+	a.model.ApplyFolder(a.root, entries)
+	_ = a.tv.SetExpanded(a.root, true)
+
+	rel := strings.Trim(strings.TrimPrefix(store.NormalizePath(hit.Path), "/"), "/")
+	if rel == "" {
+		a.showTree()
+		_ = a.tv.SetCurrentItem(a.root)
+		_ = a.tv.EnsureVisible(a.root)
+		return
+	}
+
+	node := a.root
+	for _, seg := range strings.Split(rel, "/") {
+		var next *Node
+		for _, c := range node.children {
+			if c.placeholder {
+				continue
+			}
+			if c.entry.Name == seg {
+				next = c
+				break
+			}
+		}
+		if next == nil {
+			walk.MsgBox(a.mw, "无法定位", "该条目的上级目录尚未同步到本地："+node.DisplayPath(), walk.MsgBoxIconInformation)
+			return
+		}
+
+		node = next
+		if !next.IsDir() {
+			break
+		}
+
+		// 只从本地缓存展开，避免触发网络同步。
+		children, cached := a.cache.Children(next.Path())
+		if !cached {
+			break
+		}
+		a.model.ApplyFolder(next, children)
+		_ = a.tv.SetExpanded(next, true)
+	}
+
+	a.showTree()
+	_ = a.tv.SetCurrentItem(node)
+	_ = a.tv.EnsureVisible(node)
+	a.setInfo(fmt.Sprintf("已定位：%s", node.DisplayPath()))
+}
+
 // UI 线程/状态辅助
 //
 

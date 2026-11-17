@@ -303,3 +303,125 @@ func boolInt(v bool) int {
 	}
 	return 0
 }
+
+// SearchHit 是本地缓存中的一条搜索结果。
+type SearchHit struct {
+	Entry
+	Path   string // 完整路径，例如 "/电影/2024/a.mp4"
+	Parent string // 父目录路径，根目录为 "/"
+}
+
+// Search 只在本地 SQLite 缓存里按名称做模糊搜索：
+//   - 忽略大小写（基于 sort_name，Go 的 Unicode 小写）；
+//   - 以空格分隔的多个关键字需要同时命中（AND）；
+//   - 结果按「完全匹配 > 前缀匹配 > 包含」排序，其次名称更短/文件夹优先；
+//   - 不会访问网络。
+func (c *Cache) Search(query string, limit int) ([]SearchHit, error) {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return nil, nil
+	}
+	if limit <= 0 || limit > 1000 {
+		limit = 500
+	}
+
+	terms := strings.Fields(strings.ToLower(query))
+	if len(terms) == 0 {
+		return nil, nil
+	}
+
+	conds := make([]string, 0, len(terms))
+	args := make([]any, 0, len(terms)+1)
+	for _, term := range terms {
+		conds = append(conds, `sort_name LIKE ? ESCAPE '\'`)
+		args = append(args, "%"+escapeLike(term)+"%")
+	}
+
+	// 多取一些候选，再在 Go 里按相关度排序、截断。
+	q := `SELECT parent, name, is_dir, size, etag, modified, content_type
+		FROM entry
+		WHERE ` + strings.Join(conds, " AND ") + `
+		ORDER BY sort_name ASC, parent ASC
+		LIMIT ?`
+	args = append(args, limit*4)
+
+	rows, err := c.db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	hits := make([]SearchHit, 0, limit)
+	for rows.Next() {
+		var (
+			h        SearchHit
+			isDir    int
+			modified int64
+		)
+		if err := rows.Scan(&h.Parent, &h.Name, &isDir, &h.Size, &h.ETag, &modified, &h.ContentType); err != nil {
+			return nil, err
+		}
+		h.IsDir = isDir != 0
+		if modified > 0 {
+			h.Modified = time.Unix(0, modified)
+		}
+		h.Parent = NormalizePath(h.Parent)
+		h.Path = entryPath(h.Parent, h.Name)
+		hits = append(hits, h)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	q = strings.ToLower(query)
+	sort.SliceStable(hits, func(i, j int) bool {
+		a, b := hits[i], hits[j]
+
+		if ra, rb := matchRank(a.Name, q), matchRank(b.Name, q); ra != rb {
+			return ra < rb
+		}
+		if len(a.Name) != len(b.Name) {
+			return len(a.Name) < len(b.Name)
+		}
+		if a.IsDir != b.IsDir {
+			return a.IsDir
+		}
+		an, bn := strings.ToLower(a.Name), strings.ToLower(b.Name)
+		if an != bn {
+			return an < bn
+		}
+		return a.Path < b.Path
+	})
+
+	if len(hits) > limit {
+		hits = hits[:limit]
+	}
+	return hits, nil
+}
+
+// matchRank 给搜索结果打相关度：0 完全相同，1 前缀匹配，2 包含，3 其它（多关键字）。
+func matchRank(name, query string) int {
+	n := strings.ToLower(name)
+	switch {
+	case n == query:
+		return 0
+	case strings.HasPrefix(n, query):
+		return 1
+	case strings.Contains(n, query):
+		return 2
+	default:
+		return 3
+	}
+}
+
+// escapeLike 转义 LIKE 通配符，避免用户输入的 % / _ 被当成通配符。
+func escapeLike(s string) string {
+	return strings.NewReplacer(`\`, `\`, `%`, `\%`, `_`, `\_`).Replace(s)
+}
+
+func entryPath(parent, name string) string {
+	if parent == "/" || parent == "" {
+		return "/" + name
+	}
+	return parent + "/" + name
+}

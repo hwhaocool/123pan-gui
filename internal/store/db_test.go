@@ -194,3 +194,103 @@ func names(entries []Entry) []string {
 	}
 	return out
 }
+
+// TestSearch 验证本地模糊搜索：忽略大小写、子串匹配、多关键字、通配符转义、排序。
+func TestSearch(t *testing.T) {
+	c, err := Open(filepath.Join(t.TempDir(), "tree.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { c.Close() })
+
+	if err := c.SetFolder("/", []Entry{
+		{Name: "Movies", IsDir: true},
+		{Name: "The Movie Collection.mp4", Size: 100},
+		{Name: "报告2025.pdf", Size: 200},
+		{Name: "README.md", Size: 300},
+		{Name: "100%_done.txt", Size: 400},
+	}); err != nil {
+		t.Fatalf("SetFolder: %v", err)
+	}
+	if err := c.SetFolder("/Movies", []Entry{
+		{Name: "Interstellar.mkv", Size: 500},
+		{Name: "inception.MKV", Size: 600},
+	}); err != nil {
+		t.Fatalf("SetFolder: %v", err)
+	}
+
+	// 忽略大小写的子串匹配 + 相关度排序（前缀优先）。
+	hits, err := c.Search("movie", 20)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(hits) != 2 {
+		t.Fatalf("hits = %v", hitNames(hits))
+	}
+	if hits[0].Name != "Movies" || !hits[0].IsDir {
+		t.Fatalf("first hit = %+v, want Movies (prefix match)", hits[0])
+	}
+	if hits[1].Name != "The Movie Collection.mp4" {
+		t.Fatalf("second hit = %+v", hits[1])
+	}
+
+	// 子目录里的文件也要能搜到，并带完整路径。
+	hits, err = c.Search("INCEPTION", 20)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(hits) != 1 {
+		t.Fatalf("hits = %v", hitNames(hits))
+	}
+	if hits[0].Path != "/Movies/inception.MKV" || hits[0].Parent != "/Movies" {
+		t.Fatalf("hit = %+v", hits[0])
+	}
+
+	// 中文搜索。
+	hits, _ = c.Search("报告", 20)
+	if len(hits) != 1 || hits[0].Name != "报告2025.pdf" {
+		t.Fatalf("hits = %v", hitNames(hits))
+	}
+
+	// 空格分隔的多关键字（AND）。
+	hits, _ = c.Search("报告 PDF", 20)
+	if len(hits) != 1 || hits[0].Name != "报告2025.pdf" {
+		t.Fatalf("multi-term hits = %v", hitNames(hits))
+	}
+	hits, _ = c.Search("报告 docx", 20)
+	if len(hits) != 0 {
+		t.Fatalf("multi-term hits = %v, want none", hitNames(hits))
+	}
+
+	// LIKE 通配符必须被转义：% 只匹配字面量 %。
+	hits, _ = c.Search("%", 20)
+	if len(hits) != 1 || hits[0].Name != "100%_done.txt" {
+		t.Fatalf("wildcard hits = %v", hitNames(hits))
+	}
+	hits, _ = c.Search("_done", 20)
+	if len(hits) != 1 || hits[0].Name != "100%_done.txt" {
+		t.Fatalf("underscore hits = %v", hitNames(hits))
+	}
+
+	// 空查询 / 无匹配。
+	if hits, err := c.Search("   ", 20); err != nil || len(hits) != 0 {
+		t.Fatalf("empty query = %v, %v", hitNames(hits), err)
+	}
+	if hits, err := c.Search("不存在的名字", 20); err != nil || len(hits) != 0 {
+		t.Fatalf("no-match query = %v, %v", hitNames(hits), err)
+	}
+
+	// limit 生效。
+	hits, _ = c.Search("e", 2)
+	if len(hits) != 2 {
+		t.Fatalf("limit not applied: %d", len(hits))
+	}
+}
+
+func hitNames(hits []SearchHit) []string {
+	out := make([]string, len(hits))
+	for i, h := range hits {
+		out[i] = h.Path
+	}
+	return out
+}
