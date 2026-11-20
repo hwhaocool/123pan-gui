@@ -383,11 +383,11 @@ func (a *App) filesView(c *ui.Context, t *ui.Theme) {
 		a.fileList.Key = func(i int) any { return entries[i].Path() }
 		cols := []ui.TableColumn{
 			{Title: "名称"},
-			{Title: "大小", Width: 100, Align: ui.End},
-			{Title: "创建时间", Width: 165},
-			{Title: "修改时间", Width: 165},
-			{Title: "ETag", Width: 150},
-			{Title: "", Width: 44, Align: ui.Center},
+			{Title: "大小", Width: 90, Align: ui.End},
+			{Title: "创建时间", Width: 130},
+			{Title: "修改时间", Width: 130},
+			{Title: "ETag", Width: 110},
+			{Title: "", Width: 56, Align: ui.Center},
 		}
 		if ui.Table(c, &a.fileList, cols, len(entries), func(row, col int) {
 			e := entries[row].Entry()
@@ -413,7 +413,7 @@ func (a *App) filesView(c *ui.Context, t *ui.Theme) {
 				if e.ETag == "" {
 					ui.Text(c, "-").TextColor(t.TextMuted)
 				} else {
-					ui.Text(c, e.ETag).TextColor(t.TextMuted).SingleLine()
+					ui.Text(c, e.ETag).TextColor(t.TextMuted).SingleLine().Tooltip(e.ETag)
 				}
 			case 5:
 				node := entries[row]
@@ -422,6 +422,7 @@ func (a *App) filesView(c *ui.Context, t *ui.Theme) {
 					Tooltip("删除「" + node.Name() + "」").
 					Disabled(a.busy || a.deleting).
 					OnClick(func() { a.askDelete(node) }).
+					MarginEnd(t.Space(2)).
 					Children(func() {
 						ui.Icon(c, iconTrash).Size(16, 16).TextColor(t.Danger)
 					})
