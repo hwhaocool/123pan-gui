@@ -1,0 +1,144 @@
+name: release
+
+# 推送 tag（v1.2.3 / v0.1 之类）即自动构建 windows/amd64 单文件 exe 并创建 Release。
+# 也可以在 Actions 页面手动触发，只构建产物（不上传 Release）。
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '手动构建使用的版本号（例如 v0.1.0；留空则为 dev）'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # mygo v0.9.2 要求 Go 1.27.3+；允许 go 命令按 go.mod 里的 toolchain 自动切换
+  GOTOOLCHAIN: auto
+  CGO_ENABLED: '0'
+
+jobs:
+  build:
+    name: build windows/amd64
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 解析版本号
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            raw='${{ inputs.version }}'
+            [ -z "$raw" ] && raw=dev
+          else
+            raw="${GITHUB_REF_NAME}"
+          fi
+          # 文件名里只保留 [0-9A-Za-z._-]，其它字符替换成 -
+          ver="$(printf '%s' "$raw" | sed 's/[^0-9A-Za-z._-]/-/g')"
+          [ -z "$ver" ] && ver=dev
+          exe="123pan-client-${ver}-windows-amd64.exe"
+          {
+            echo "version=$ver"
+            echo "exe=$exe"
+            echo "raw=$raw"
+          } >> "$GITHUB_OUTPUT"
+          echo "tag/版本: $raw -> $ver"
+          echo "产物名  : $exe"
+
+      - name: Setup Go（按 go.mod 指定的工具链）
+        id: setup-go-pinned
+        continue-on-error: true
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+
+      # go.mod 里的版本万一在 go.dev 上取不到（例如只有更新的补丁版本），退回 stable，
+      # 由 GOTOOLCHAIN=auto 按 go.mod 的 toolchain 指令再切到正确版本。
+      - name: Setup Go（回退到 stable）
+        if: steps.setup-go-pinned.outcome == 'failure'
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          check-latest: true
+          cache: true
+
+      - name: 检查工具链
+        shell: bash
+        run: |
+          go version
+          go env GOROOT GOVERSION GOTOOLCHAIN
+
+      - name: 确保图标资源 rsrc.syso 存在
+        shell: bash
+        run: |
+          if [ -f rsrc.syso ]; then
+            echo "rsrc.syso 已存在（$(stat -c %s rsrc.syso) 字节），直接使用"
+          else
+            echo "rsrc.syso 缺失，从 app.ico 重新打包"
+            go run github.com/akavel/rsrc@v0.10.2 -arch amd64 -ico app.ico -o rsrc.syso
+          fi
+
+      - name: 构建 exe
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          out="dist/${{ steps.ver.outputs.exe }}"
+          go build -trimpath -ldflags "-s -w -H windowsgui" -o "$out" .
+          ls -l dist/
+          size=$(stat -c %s "$out")
+          echo "构建产物 $out（$size 字节）" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$size" -lt 1000000 ]; then
+            echo "::error::产物大小仅 $size 字节，可能构建失败"
+            exit 1
+          fi
+
+      - name: 生成校验和
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum *.exe > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: 123pan-client-${{ steps.ver.outputs.version }}-windows-amd64
+          path: dist/*
+          if-no-files-found: error
+
+      - name: 创建 Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ steps.ver.outputs.raw }}
+          tag_name: ${{ github.ref_name }}
+          files: |
+            dist/${{ steps.ver.outputs.exe }}
+            dist/SHA256SUMS.txt
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          body: |
+            Windows 10 / 11（amd64）单文件绿色版，双击即可运行，无需安装。
+
+            - 下载：`${{ steps.ver.outputs.exe }}`
+            - 校验：`SHA256SUMS.txt`
+            - 数据都放在 exe 所在目录（`config.json` / `tree.db`），可整目录拷走
+            - 首次运行请先在「设置…」里填 WebDAV 地址与账号（默认 `https://webdav.123pan.cn/webdav`）
+
+            构建信息：Go ${{ steps.setup-go-pinned.outputs.go-version || 'stable' }} / ${{ runner.os }}

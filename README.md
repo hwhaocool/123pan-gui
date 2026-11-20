@@ -121,7 +121,18 @@ go build -trimpath -ldflags "-s -w -H windowsgui" -o 123pan-client.exe .
 
 > 图标源图在 `res/keji.svg`，重新生成图标、PE 资源等细节见 [tech.md](tech.md) 的「应用图标」一节。
 
+### 发布（GitHub Actions）
 
+推送 `v` 开头的 tag 会自动构建并发布（[.github/workflows/release.yml](.github/workflows/release.yml)）：
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+- 产物：`123pan-client-<tag>-windows-amd64.exe`（例：`123pan-client-v0.1.0-windows-amd64.exe`）+ `SHA256SUMS.txt`
+- 自动创建同名 GitHub Release，带自动生成的 changelog
+- 也能在 Actions 页面手动触发（`Run workflow`），只构建并上传 artifact，不发 Release
 
 ## 注意事项
 

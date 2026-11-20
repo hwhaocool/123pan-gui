@@ -61,6 +61,28 @@ go build -trimpath -ldflags "-s -w -H windowsgui" -o 123pan-client.exe .
 
 > mygo 在启动时会自己设置 Per-Monitor V2 DPI 感知，因此不需要 manifest；但 exe 的**文件图标**需要 `rsrc.syso`（见下节），产物仍然是单个 exe。
 
+### 发布流水线（GitHub Actions）
+
+`.github/workflows/release.yml`：推送 `v*` tag 即自动构建并发布 Release；`workflow_dispatch` 可手动构建只出 artifact。
+
+| 环节 | 做法 |
+| --- | --- |
+| 触发 | `push: tags: v*`，或 Actions 页 `Run workflow`（可填版本号，留空为 `dev`） |
+| 运行器 | `windows-latest`（原生构建，不用交叉编译） |
+| 工具链 | `actions/setup-go` 读 `go.mod`（`check-latest`）；取不到时回退 `stable`，再由 `GOTOOLCHAIN=auto` 按 `toolchain` 指令切换 |
+| 图标资源 | `rsrc.syso` 已在仓库里，存在就直接用；缺失时 `go run github.com/akavel/rsrc@v0.10.2` 从 `app.ico` 重新打包 |
+| 构建命令 | `go build -trimpath -ldflags "-s -w -H windowsgui" -o dist/<name>.exe .` |
+| 产物命名 | `123pan-client-<tag>-windows-amd64.exe`（tag 里除 `[0-9A-Za-z._-]` 外的字符替换为 `-`） |
+| 校验 | `dist/SHA256SUMS.txt` |
+| 发布 | `softprops/action-gh-release@v2`，文件名即产物，`generate_release_notes` 自动 changelog，需要 `permissions: contents: write` |
+| 兜底 | 产物小于 1 MB 视为构建失败；`fail_on_unmatched_files` 防止漏传 |
+
+本地想复现同样的产物：
+
+```bash
+go build -trimpath -ldflags "-s -w -H windowsgui" -o dist/123pan-client-v0.1.0-windows-amd64.exe .
+```
+
 ### 应用图标
 
 图标源图是 `res/keji.svg`（1024×1024 矢量），由 `tools/genicon`（只依赖 mygo，无需 Inkscape/ImageMagick）光栅化并编码成多尺寸 ICO：
