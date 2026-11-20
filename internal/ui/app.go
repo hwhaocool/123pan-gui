@@ -36,10 +36,9 @@ type App struct {
 	selected      *Node
 	pendingReveal *Node
 
-	includeSubdirs bool
-	busy           bool
-	status         string
-	info           string
+	busy   bool
+	status string
+	info   string
 
 	logs       []string
 	logList    ui.ListState
@@ -74,8 +73,6 @@ type App struct {
 	settingsStatus  string
 	settingsTesting bool
 
-	confirmSyncAll bool
-
 	deleting     bool
 	deleteTarget *Node
 	deleteOpen   bool
@@ -88,7 +85,6 @@ type App struct {
 func NewApp() *App {
 	a := &App{
 		status:          "就绪",
-		includeSubdirs:  true,
 		topPercent:      74,
 		leftWidth:       320,
 		fileSelected:    -1,
@@ -232,15 +228,16 @@ func (a *App) errorView(c *ui.Context, t *ui.Theme) {
 
 func (a *App) toolbar(c *ui.Context) {
 	ui.Row(c).Padding(10, 8).Gap(8).AlignItems(ui.Center).Children(func() {
-		ui.PrimaryButton(c, "同步选中目录").
+		ui.PrimaryButton(c, "同步选中目录(和子目录)").
 			Disabled(a.busy).
-			OnClick(a.syncSelected)
-		ui.Button(c, "同步全部").Disabled(a.busy).OnClick(func() { a.confirmSyncAll = true })
+			OnClick(func() { a.syncSelected(true) })
+		ui.Button(c, "同步选中目录(单层)").
+			Disabled(a.busy).
+			OnClick(func() { a.syncSelected(false) })
 		ui.Button(c, "停止").Disabled(!a.busy).OnClick(func() {
 			a.syncer.Stop()
 			a.status = "正在停止…"
 		})
-		ui.Checkbox(c, &a.includeSubdirs, "包含子目录")
 		ui.Button(c, "重复文件检测").
 			Tooltip("在本地缓存中查找同名文件（不含文件夹）").
 			OnClick(a.detectDuplicates)
@@ -553,12 +550,6 @@ func (a *App) alert(c *ui.Context) {
 			}
 		}
 	}
-
-	if ui.AlertDialog(c, &a.confirmSyncAll, "同步全部",
-		"将递归同步整个 WebDAV 目录树；目录较多时可能需要较长时间，是否继续？",
-		"取消", "开始同步") == 1 {
-		a.syncAll()
-	}
 }
 
 //
@@ -596,7 +587,9 @@ func describeNode(n *Node) string {
 		n.DisplayPath(), FormatSize(e.Size), formatTime(e.Created), formatTime(e.Modified), etag)
 }
 
-func (a *App) syncSelected() {
+// syncSelected 同步目录树中选中的文件夹（未选中时用根目录）：
+// recursive 为 true 时递归子目录，否则只刷新这一层。
+func (a *App) syncSelected(recursive bool) {
 	n := a.selected
 	if n == nil {
 		n = a.root
@@ -606,14 +599,7 @@ func (a *App) syncSelected() {
 		a.status = "请选择文件夹"
 		return
 	}
-	a.submitSync(n, a.includeSubdirs)
-}
-
-func (a *App) syncAll() {
-	if a.root == nil {
-		return
-	}
-	a.submitSync(a.root, true)
+	a.submitSync(n, recursive)
 }
 
 func (a *App) submitSync(n *Node, recursive bool) {
