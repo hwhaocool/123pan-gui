@@ -3,13 +3,18 @@
 // 用法（在仓库根目录执行）：
 //
 //	go run ./tools/genicon -o app.ico -pngout internal/ui/appicon.png
+//	go run ./tools/genicon -src ./res/小老虎.png -smallcrop 0.23,0.05,0.77,0.53 -o app.ico -pngout internal/ui/appicon.png
 //	go run ./tools/genicon -o app.ico -preview ./.icon-preview   # 额外输出各尺寸 PNG 便于检查
+//
+// -src 指定一张 PNG/JPEG 作为图标源图（正方形、建议 >=200px）：会先裁掉透明边、
+// 居中成正方形并留少量边距，再用面积平均 / 双线性重采样成各尺寸；不给 -src 时用内置绘制。
+// -smallcrop 指定 <= -smallmax（默认 32）的尺寸使用的裁剪区域（0~1 比例），
+// 整图缩到 16px 会糊，换成只含主体（如头部）的区域更易辨认。
 //
 // 输出 16/20/24/32/40/48/64/128/256 九个尺寸；<=64px 用 32 位 DIB（兼容性最好），
 // 更大尺寸用 PNG（Vista+ 支持），可直接交给 rsrc / goversioninfo / windres 打包进 exe。
 //
-// 图形：蓝紫渐变圆角底 + 白色云朵；48px 以上右下角加琥珀色圆形徽标（向上箭头）。
-// 小尺寸（<=32px）只画云并放大到接近满版，避免细节糊成一团。
+// 不给 -src 时的内置图形：蓝紫渐变圆角底 + 白色云朵，48px 以上加琥珀色圆形徽标。
 package main
 
 import (
@@ -234,6 +239,280 @@ func downsample(src *canvas, f int) *image.NRGBA {
 
 func render(size int) *image.NRGBA { return downsample(draw(size*ss), ss) }
 
+// ---------------- 用户提供的源图 ----------------
+
+// loadSource 读取 PNG/JPEG 源图，转成 NRGBA 并居中裁成正方形。
+func loadSource(path string) (*image.NRGBA, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	img, _, err := image.Decode(f)
+	if err != nil {
+		return nil, fmt.Errorf("解码 %s: %w", path, err)
+	}
+
+	b := img.Bounds()
+	side := b.Dx()
+	if b.Dy() < side {
+		side = b.Dy()
+	}
+	x0 := b.Min.X + (b.Dx()-side)/2
+	y0 := b.Min.Y + (b.Dy()-side)/2
+
+	out := image.NewNRGBA(image.Rect(0, 0, side, side))
+	for y := 0; y < side; y++ {
+		for x := 0; x < side; x++ {
+			out.SetNRGBA(x, y, color.NRGBAModel.Convert(img.At(x0+x, y0+y)).(color.NRGBA))
+		}
+	}
+	fmt.Printf("源图 %s：%dx%d，裁剪后 %dx%d\n", path, b.Dx(), b.Dy(), side, side)
+	if side < 200 {
+		fmt.Println("提示：源图小于 200px，256 尺寸需要放大，可能略软；建议提供 >=256px 的图")
+	}
+	return out, nil
+}
+
+// trimSquare 裁掉四周的全透明边，居中成正方形并留 padRatio 的边距，
+// 让小尺寸下图形更大、更清晰。
+func trimSquare(src *image.NRGBA, padRatio float64) *image.NRGBA {
+	b := src.Bounds()
+	minX, minY, maxX, maxY := b.Dx(), b.Dy(), -1, -1
+	for y := b.Min.Y; y < b.Max.Y; y++ {
+		for x := b.Min.X; x < b.Max.X; x++ {
+			if src.NRGBAAt(x, y).A > 8 { // 忽略几乎全透明的边缘
+				if x < minX {
+					minX = x
+				}
+				if x > maxX {
+					maxX = x
+				}
+				if y < minY {
+					minY = y
+				}
+				if y > maxY {
+					maxY = y
+				}
+			}
+		}
+	}
+	if maxX < minX || maxY < minY {
+		return src // 全透明：原样返回
+	}
+
+	cw, ch := maxX-minX+1, maxY-minY+1
+	side := cw
+	if ch > side {
+		side = ch
+	}
+	sidePad := int(math.Round(float64(side) * padRatio))
+	out := image.NewNRGBA(image.Rect(0, 0, side+2*sidePad, side+2*sidePad))
+
+	ox := sidePad + (side-cw)/2
+	oy := sidePad + (side-ch)/2
+	for y := 0; y < ch; y++ {
+		for x := 0; x < cw; x++ {
+			out.SetNRGBA(ox+x, oy+y, src.NRGBAAt(minX+x, minY+y))
+		}
+	}
+	fmt.Printf("裁掉透明边：%dx%d -> 有效 %dx%d，输出 %dx%d\n", b.Dx(), b.Dy(), cw, ch, out.Bounds().Dx(), out.Bounds().Dy())
+	return out
+}
+
+// centerSquare 把 src 中的 (minX,minY,cw,ch) 区域居中放到正方形画布上，四周留 padRatio 边距。
+func centerSquare(src *image.NRGBA, minX, minY, cw, ch int, padRatio float64) *image.NRGBA {
+	side := cw
+	if ch > side {
+		side = ch
+	}
+	sidePad := int(math.Round(float64(side) * padRatio))
+	out := image.NewNRGBA(image.Rect(0, 0, side+2*sidePad, side+2*sidePad))
+
+	ox := sidePad + (side-cw)/2
+	oy := sidePad + (side-ch)/2
+	for y := 0; y < ch; y++ {
+		for x := 0; x < cw; x++ {
+			out.SetNRGBA(ox+x, oy+y, src.NRGBAAt(minX+x, minY+y))
+		}
+	}
+	return out
+}
+
+// cropSquare 按相对比例 (x0,y0,x1,y1) 从 src 裁剪一块区域，居中成正方形（带 padRatio 边距）。
+// 用于小尺寸：整图缩到 16px 会糊，改用只含头部的区域更易辨认。
+func cropSquare(src *image.NRGBA, r [4]float64, padRatio float64) *image.NRGBA {
+	b := src.Bounds()
+	w, h := float64(b.Dx()), float64(b.Dy())
+
+	clamp01 := func(v float64) float64 { return math.Max(0, math.Min(1, v)) }
+	x0 := int(clamp01(r[0]) * w)
+	y0 := int(clamp01(r[1]) * h)
+	x1 := int(clamp01(r[2]) * w)
+	y1 := int(clamp01(r[3]) * h)
+	if x1 <= x0 || y1 <= y0 {
+		return src
+	}
+	cw, ch := x1-x0, y1-y0
+	out := centerSquare(src, b.Min.X+x0, b.Min.Y+y0, cw, ch, padRatio)
+	fmt.Printf("小尺寸裁剪：%v -> 有效 %dx%d，输出 %dx%d\n", r, cw, ch, out.Bounds().Dx(), out.Bounds().Dy())
+	return out
+}
+
+// parseCrop 解析 "x0,y0,x1,y1" 形式的裁剪比例。
+func parseCrop(s string) ([4]float64, error) {
+	var r [4]float64
+	parts := strings.Split(s, ",")
+	if len(parts) != 4 {
+		return r, fmt.Errorf("裁剪区域需要 4 个 0~1 的数字: %q", s)
+	}
+	for i, p := range parts {
+		v, err := strconv.ParseFloat(strings.TrimSpace(p), 64)
+		if err != nil || v < 0 || v > 1 {
+			return r, fmt.Errorf("裁剪区域第 %d 个值非法: %q", i+1, p)
+		}
+		r[i] = v
+	}
+	return r, nil
+}
+
+// resample 把源图缩放到 size×size：放大用双线性，缩小用面积平均（都在预乘 alpha 下计算，
+// 避免透明边缘发黑）。源图必须是正方形。
+func resample(src *image.NRGBA, size int) *image.NRGBA {
+	if size >= src.Bounds().Dx() {
+		return resampleBilinear(src, size)
+	}
+	return resampleArea(src, size)
+}
+
+// resampleBilinear 双线性插值（预乘 alpha）。
+func resampleBilinear(src *image.NRGBA, size int) *image.NRGBA {
+	b := src.Bounds()
+	sw, sh := b.Dx(), b.Dy()
+	dst := image.NewNRGBA(image.Rect(0, 0, size, size))
+
+	premul := func(x, y int) (r, g, bl, a float64) {
+		if x < 0 {
+			x = 0
+		}
+		if x >= sw {
+			x = sw - 1
+		}
+		if y < 0 {
+			y = 0
+		}
+		if y >= sh {
+			y = sh - 1
+		}
+		c := src.NRGBAAt(b.Min.X+x, b.Min.Y+y)
+		af := float64(c.A)
+		return float64(c.R) * af, float64(c.G) * af, float64(c.B) * af, af
+	}
+
+	for dy := 0; dy < size; dy++ {
+		// 采样点对齐到像素中心
+		fy := (float64(dy)+0.5)*float64(sh)/float64(size) - 0.5
+		y0 := int(math.Floor(fy))
+		ty := fy - float64(y0)
+		for dx := 0; dx < size; dx++ {
+			fx := (float64(dx)+0.5)*float64(sw)/float64(size) - 0.5
+			x0 := int(math.Floor(fx))
+			tx := fx - float64(x0)
+
+			var sr, sg, sb, sa float64
+			for _, sy := range []int{y0, y0 + 1} {
+				wy := ty
+				if sy == y0 {
+					wy = 1 - ty
+				}
+				for _, sx := range []int{x0, x0 + 1} {
+					wx := tx
+					if sx == x0 {
+						wx = 1 - tx
+					}
+					r, g, bl, a := premul(sx, sy)
+					w := wx * wy
+					sr += r * w
+					sg += g * w
+					sb += bl * w
+					sa += a * w
+				}
+			}
+			if sa <= 0 {
+				continue
+			}
+			dst.SetNRGBA(dx, dy, color.NRGBA{
+				R: clamp8(sr / sa),
+				G: clamp8(sg / sa),
+				B: clamp8(sb / sa),
+				A: clamp8(sa),
+			})
+		}
+	}
+	return dst
+}
+
+// resampleArea 面积平均（像素覆盖加权，预乘 alpha）；用于缩小。
+func resampleArea(src *image.NRGBA, size int) *image.NRGBA {
+	b := src.Bounds()
+	sw, sh := b.Dx(), b.Dy()
+	dst := image.NewNRGBA(image.Rect(0, 0, size, size))
+	sx := float64(sw) / float64(size)
+	sy := float64(sh) / float64(size)
+
+	for dy := 0; dy < size; dy++ {
+		y0, y1 := float64(dy)*sy, float64(dy+1)*sy
+		iy0, iy1 := int(math.Floor(y0)), int(math.Ceil(y1))
+		for dx := 0; dx < size; dx++ {
+			x0, x1 := float64(dx)*sx, float64(dx+1)*sx
+			ix0, ix1 := int(math.Floor(x0)), int(math.Ceil(x1))
+
+			var sr, sg, sb, sa, wsum float64
+			for y := max(iy0, 0); y < min(iy1, sh); y++ {
+				wy := math.Min(float64(y+1), y1) - math.Max(float64(y), y0)
+				if wy <= 0 {
+					continue
+				}
+				for x := max(ix0, 0); x < min(ix1, sw); x++ {
+					wx := math.Min(float64(x+1), x1) - math.Max(float64(x), x0)
+					if wx <= 0 {
+						continue
+					}
+					w := wx * wy
+					c := src.NRGBAAt(b.Min.X+x, b.Min.Y+y)
+					af := float64(c.A)
+					sr += float64(c.R) * af * w
+					sg += float64(c.G) * af * w
+					sb += float64(c.B) * af * w
+					sa += af * w
+					wsum += w
+				}
+			}
+			if wsum <= 0 || sa <= 0 {
+				continue
+			}
+			dst.SetNRGBA(dx, dy, color.NRGBA{
+				R: clamp8(sr / sa),
+				G: clamp8(sg / sa),
+				B: clamp8(sb / sa),
+				A: clamp8(sa / wsum),
+			})
+		}
+	}
+	return dst
+}
+
+func clamp8(v float64) uint8 {
+	if v <= 0 {
+		return 0
+	}
+	if v >= 255 {
+		return 255
+	}
+	return uint8(math.Round(v))
+}
+
 // ---------------- ICO 编码 ----------------
 
 // encodeICO 输出 ICO：<=64px 用 32 位 DIB，更大尺寸用 PNG。
@@ -356,7 +635,35 @@ func main() {
 	c1 := flag.String("c1", "#3FA2FF", "圆角底渐变的起始色（#RRGGBB）")
 	c2 := flag.String("c2", "#2B49D8", "圆角底渐变的结束色（#RRGGBB）")
 	sizesFlag := flag.String("sizes", "16,20,24,32,40,48,64,128,256", "逗号分隔的尺寸列表")
+	srcPath := flag.String("src", "", "可选：用 PNG/JPEG 源图代替内置图形（正方形，建议 >=200px）")
+	pad := flag.Float64("pad", 0.04, "使用 -src 时四周留白比例（0~0.2）")
+	smallCrop := flag.String("smallcrop", "", "可选：小尺寸使用的裁剪区域 x0,y0,x1,y1（0~1 比例，相对 -src 图）")
+	smallMax := flag.Int("smallmax", 32, "<= 该尺寸时使用 -smallcrop 的区域")
 	flag.Parse()
+
+	var source, smallSource *image.NRGBA
+	if *srcPath != "" {
+		s, err := loadSource(*srcPath)
+		if err != nil {
+			log.Fatal(err)
+		}
+		padRatio := *pad
+		if padRatio < 0 {
+			padRatio = 0
+		}
+		if padRatio > 0.2 {
+			padRatio = 0.2
+		}
+		source = trimSquare(s, padRatio)
+
+		if *smallCrop != "" {
+			r, err := parseCrop(*smallCrop)
+			if err != nil {
+				log.Fatal(err)
+			}
+			smallSource = cropSquare(source, r, padRatio)
+		}
+	}
 
 	colBGTop = parseHex(*c1, colBGTop)
 	colBGBottom = parseHex(*c2, colBGBottom)
@@ -372,7 +679,16 @@ func main() {
 
 	imgs := make(map[int]*image.NRGBA, len(sizes))
 	for _, s := range sizes {
-		imgs[s] = render(s)
+		if source != nil {
+			switch {
+			case smallSource != nil && s <= *smallMax:
+				imgs[s] = resample(smallSource, s)
+			default:
+				imgs[s] = resample(source, s)
+			}
+		} else {
+			imgs[s] = render(s)
+		}
 		if *preview != "" {
 			writePNG(filepath.Join(*preview, fmt.Sprintf("icon-%d.png", s)), imgs[s])
 		}
