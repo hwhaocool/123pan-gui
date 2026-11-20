@@ -386,6 +386,7 @@ func (a *App) filesView(c *ui.Context, t *ui.Theme) {
 			{Title: "大小", Width: 100, Align: ui.End},
 			{Title: "创建时间", Width: 165},
 			{Title: "修改时间", Width: 165},
+			{Title: "ETag", Width: 150},
 			{Title: "", Width: 44, Align: ui.Center},
 		}
 		if ui.Table(c, &a.fileList, cols, len(entries), func(row, col int) {
@@ -409,6 +410,12 @@ func (a *App) filesView(c *ui.Context, t *ui.Theme) {
 			case 3:
 				ui.Text(c, formatTime(e.Modified)).TextColor(t.TextMuted)
 			case 4:
+				if e.ETag == "" {
+					ui.Text(c, "-").TextColor(t.TextMuted)
+				} else {
+					ui.Text(c, e.ETag).TextColor(t.TextMuted).SingleLine()
+				}
+			case 5:
 				node := entries[row]
 				ui.Button(c, "").
 					Label("删除").
