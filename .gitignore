@@ -17,6 +17,10 @@ config.json.tmp
 run.log
 *.log
 
+# 图标预览 / 校验截图（由 tools/genicon、check-icon.ps1 生成）
+.icon-preview/
+.icon-check/
+
 # 编辑器
 .idea/
 .vscode/

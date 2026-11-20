@@ -34,6 +34,7 @@
 - **停止**：随时取消当前同步，并清空排队中的任务。
 - **本地搜索**：按文件名 / 文件夹名模糊搜索（忽略大小写，空格分隔多关键字 AND），**只查本地 SQLite 缓存，不访问服务器**；双击结果在目录树中定位（同样只用缓存）。
 - **重复文件检测**：扫描本地缓存找出**同名文件**（只算文件，不算文件夹，忽略大小写），左侧列出文件名，右侧显示每个文件的名称 / 路径 / 大小 / 创建时间 / 修改时间；双击可定位到目录树。同样只读缓存，不联网。
+- **应用图标**：蓝紫渐变 + 白云 + 琥珀徽标的多尺寸图标（16~256px）；exe 文件图标打包进 PE 资源，窗口/任务栏图标运行时设置。
 - **日志面板**：底部实时显示同步过程；`跟随末尾`，新日志自动滚到底部。
 - **窗口状态记忆**：窗口大小/位置/最大化状态由 mygo 的 `StateKey` 记住。
 
@@ -49,13 +50,27 @@
 # 开发运行（会弹出一个原生窗口）
 go run .
 
-# 编译（-H windowsgui 表示不带控制台窗口）
+# 编译（-H windowsgui 表示不带控制台窗口；rsrc.syso 会自动链接进 exe）
 go build -trimpath -ldflags "-s -w -H windowsgui" -o 123pan-client.exe .
 ```
 
-或者直接运行 `build.bat`（gofmt + go build）。
+或者直接运行 `build.bat`（gofmt + go build；`rsrc.syso` 不存在时会先打包图标）。
 
-> mygo 在启动时会自己设置 Per-Monitor V2 DPI 感知，因此不再需要 manifest / `rsrc.syso`；产物是单个 exe。
+> mygo 在启动时会自己设置 Per-Monitor V2 DPI 感知，因此不需要 manifest；但 exe 的**文件图标**需要 `rsrc.syso`（见下节），产物仍然是单个 exe。
+
+### 应用图标
+
+图标由 `tools/genicon`（纯标准库）绘制并编码成多尺寸 ICO：
+
+```bash
+go run ./tools/genicon -o app.ico -pngout internal/ui/appicon.png
+go run github.com/akavel/rsrc@v0.10.2 -arch amd64 -ico app.ico -o rsrc.syso   # 或 build.bat res
+```
+
+- `app.ico`（16/20/24/32/40/48/64 用 DIB，128/256 用 PNG）→ 由 `rsrc.syso` 打包进 PE 资源，决定**文件图标**（资源管理器 / 开始菜单 / 任务栏固定项）。
+- `internal/ui/appicon.png`（256px，`go:embed`）→ 启动时 `win.SetIcon(...)` 设置**窗口标题栏 / 任务栏图标**。
+- 换图标：改 `tools/genicon/main.go` 的 `draw()`（或用你自己的 `app.ico` 覆盖），重新生成 `app.ico` + `appicon.png`，再跑一次 `build.bat res` 重建资源，不需要改代码。
+- 小尺寸（≤32px）单独绘制（只画云、放大到接近满版），避免标题栏里糊成一团。
 
 ## 使用
 
@@ -160,8 +175,14 @@ internal/
   ui/syncer.go           同步队列 worker（串行、可取消、去重）
   ui/settings.go         设置页（WebDAV 地址/账号、测试连接）
   ui/format.go           文件大小 / 时间格式化
+  ui/icon.go             窗口图标（go:embed appicon.png）
   ui/model_test.go       节点合并、展开规则、路径查找测试
   ui/syncer_test.go      同步链路测试（假 WebDAV 服务）
+  ui/toolbar_test.go     工具栏按钮 / 同步参数测试
+  ui/duplicates_test.go  重复文件检测测试（含无头渲染）
+tools/genicon/main.go    应用图标生成器（多尺寸 ICO + 窗口用 PNG）
+app.ico                  exe 文件图标（多尺寸）
+rsrc.syso                图标 PE 资源（rsrc 生成，自动链接进 exe）
 ```
 
 ## 设计要点

@@ -151,6 +151,15 @@ func NewApp() *App {
 // Attach 在窗口创建后调用：启动同步 worker 并开始首次加载。
 func (a *App) Attach(win *mygo.Window) {
 	a.win = win
+
+	// 标题栏 / 任务栏图标：用与 app.ico 同一份绘制的 PNG 在运行时设置，
+	// 不依赖 PE 资源 ID（rsrc 分配的 ID 不可指定）。
+	if len(appIconPNG) > 0 {
+		if err := win.SetIcon(appIconPNG); err != nil {
+			a.addLog("设置窗口图标失败：%v", err)
+		}
+	}
+
 	if a.initErr != nil {
 		return
 	}
