@@ -34,7 +34,7 @@
 - **停止**：随时取消当前同步，并清空排队中的任务。
 - **本地搜索**：按文件名 / 文件夹名模糊搜索（忽略大小写，空格分隔多关键字 AND），**只查本地 SQLite 缓存，不访问服务器**；双击结果在目录树中定位（同样只用缓存）。
 - **重复文件检测**：扫描本地缓存找出**同名文件**（只算文件，不算文件夹，忽略大小写），左侧列出文件名，右侧显示每个文件的名称 / 路径 / 大小 / 创建时间 / 修改时间；双击可定位到目录树。同样只读缓存，不联网。
-- **应用图标**：用 `res/小老虎.png` 生成的多尺寸图标（16~256px，小尺寸单独裁头部）；exe 文件图标打包进 PE 资源，窗口/任务栏图标运行时设置。
+- **应用图标**：用 `res/keji.svg` 生成的多尺寸图标（16~256px，小尺寸单独裁头部）；exe 文件图标打包进 PE 资源，窗口/任务栏图标运行时设置。
 - **日志面板**：底部实时显示同步过程；`跟随末尾`，新日志自动滚到底部。
 - **窗口状态记忆**：窗口大小/位置/最大化状态由 mygo 的 `StateKey` 记住。
 
@@ -60,21 +60,22 @@ go build -trimpath -ldflags "-s -w -H windowsgui" -o 123pan-client.exe .
 
 ### 应用图标
 
-图标源图是 `res/小老虎.png`（200×200，透明背景），由 `tools/genicon`（纯标准库）重采样并编码成多尺寸 ICO：
+图标源图是 `res/keji.svg`（1024×1024 矢量），由 `tools/genicon`（只依赖 mygo，无需 Inkscape/ImageMagick）光栅化并编码成多尺寸 ICO：
 
 ```bash
-# 1) 从源图生成 app.ico + 窗口用 256px PNG
-go run ./tools/genicon -src ./res/小老虎.png -smallcrop 0.23,0.05,0.77,0.53     -o app.ico -pngout internal/ui/appicon.png
+# 1) SVG/PNG 源图 -> app.ico + 窗口用 256px PNG
+go run ./tools/genicon -src ./res/keji.svg -smallcrop 0.08,0,0.92,0.72 -o app.ico -pngout internal/ui/appicon.png
 
 # 2) 把 app.ico 打包成 PE 资源（或直接 build.bat res）
 go run github.com/akavel/rsrc@v0.10.2 -arch amd64 -ico app.ico -o rsrc.syso
 ```
 
+- 源图支持 **SVG / PNG / JPEG**：SVG 用 mygo 自带的光栅化器（`ui.ParseSVG().Image(1024,1024)`）画成位图，所以仓库里只留矢量源图也能复现。
 - 处理流程：居中裁正方形 → 裁掉全透明边（留 4% 边距）→ 面积平均缩小 / 双线性放大（预乘 alpha，透明边不发黑）。
-- **小尺寸单独处理**：`-smallcrop 0.23,0.05,0.77,0.53` 让 ≤32px 的条目只显示老虎头部（整只老虎缩到 16px 会糊成一团），40px 以上用全身像。
+- **小尺寸单独处理**：`-smallcrop 0.08,0,0.92,0.72` 让 ≤32px 的条目只显示狗头（整图缩到 16px 会糊成一团），40px 以上用全身像。
 - `app.ico`（16/20/24/32/40/48/64 用 DIB，128/256 用 PNG）→ 由 `rsrc.syso` 打包进 PE 资源，决定**文件图标**（资源管理器 / 开始菜单 / 任务栏固定项）。
 - `internal/ui/appicon.png`（256px，`go:embed`）→ 启动时 `win.SetIcon(...)` 设置**窗口标题栏 / 任务栏图标**。
-- 换图标：换掉 `res/小老虎.png`（或给它加 `-src`），调整 `-smallcrop` 后重跑上面两条命令 + 重新编译即可，不需要改代码。
+- 换图标：换掉 `res/keji.svg`（或改成别的 `-src`），按预览调 `-smallcrop`，重跑上面两条命令 + `build.bat` 即可，不需要改代码。
 - 不想用图片时也可以 `go run ./tools/genicon -o app.ico -pngout internal/ui/appicon.png`（不给 `-src`），使用内置的「渐变底 + 白云」图形。
 
 ## 使用
@@ -186,7 +187,8 @@ internal/
   ui/toolbar_test.go     工具栏按钮 / 同步参数测试
   ui/duplicates_test.go  重复文件检测测试（含无头渲染）
 tools/genicon/main.go    应用图标生成器（源图/内置图形 → 多尺寸 ICO + 窗口用 PNG）
-res/小老虎.png           图标源图（200x200，透明背景）
+res/keji.svg             图标源图（矢量，1024x1024）
+res/小老虎.png           备用图标源图（200x200，透明背景）
 app.ico                  exe 文件图标（多尺寸）
 rsrc.syso                图标 PE 资源（rsrc 生成，自动链接进 exe）
 ```

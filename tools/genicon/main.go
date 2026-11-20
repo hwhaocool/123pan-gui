@@ -6,8 +6,9 @@
 //	go run ./tools/genicon -src ./res/小老虎.png -smallcrop 0.23,0.05,0.77,0.53 -o app.ico -pngout internal/ui/appicon.png
 //	go run ./tools/genicon -o app.ico -preview ./.icon-preview   # 额外输出各尺寸 PNG 便于检查
 //
-// -src 指定一张 PNG/JPEG 作为图标源图（正方形、建议 >=200px）：会先裁掉透明边、
-// 居中成正方形并留少量边距，再用面积平均 / 双线性重采样成各尺寸；不给 -src 时用内置绘制。
+// -src 指定一张 SVG/PNG/JPEG 作为图标源图（建议正方形、>=200px）：SVG 用 mygo 的
+// 光栅化器画成 1024px 位图，位图则直接读取；然后裁掉透明边、居中成正方形并留少量边距，
+// 再用面积平均 / 双线性重采样成各尺寸。不给 -src 时用内置绘制。
 // -smallcrop 指定 <= -smallmax（默认 32）的尺寸使用的裁剪区域（0~1 比例），
 // 整图缩到 16px 会糊，换成只含主体（如头部）的区域更易辨认。
 //
@@ -32,6 +33,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/egoist/mygo/ui"
 )
 
 const ss = 4 // 超采样倍数（抗锯齿）
@@ -243,6 +246,10 @@ func render(size int) *image.NRGBA { return downsample(draw(size*ss), ss) }
 
 // loadSource 读取 PNG/JPEG 源图，转成 NRGBA 并居中裁成正方形。
 func loadSource(path string) (*image.NRGBA, error) {
+	if strings.EqualFold(filepath.Ext(path), ".svg") {
+		return loadSVG(path, svgRasterSize)
+	}
+
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -272,6 +279,36 @@ func loadSource(path string) (*image.NRGBA, error) {
 	if side < 200 {
 		fmt.Println("提示：源图小于 200px，256 尺寸需要放大，可能略软；建议提供 >=256px 的图")
 	}
+	return out, nil
+}
+
+// svgRasterSize 是 SVG 光栅化的边长：远大于 256，缩小到各尺寸时才不会丢细节。
+const svgRasterSize = 1024
+
+// loadSVG 用 mygo 的 SVG 光栅化器（同 mygo 依赖，无需额外工具）把 SVG 画成位图。
+// 这样 res/*.svg 可以直接当图标源图，不用装 Inkscape / ImageMagick。
+func loadSVG(path string, size int) (*image.NRGBA, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	svg, err := ui.ParseSVG(data)
+	if err != nil {
+		return nil, fmt.Errorf("解析 %s: %w", path, err)
+	}
+	if un := svg.Unsupported(); len(un) > 0 {
+		fmt.Printf("警告：%s 含不支持的特性（会被忽略）：%v\n", path, un)
+	}
+
+	// currentColor 传 nil 时按黑色画；keji.svg 的颜色都是显式 fill，不受影响。
+	img := svg.Image(size, size, nil)
+	out := image.NewNRGBA(img.Bounds())
+	for y := img.Bounds().Min.Y; y < img.Bounds().Max.Y; y++ {
+		for x := img.Bounds().Min.X; x < img.Bounds().Max.X; x++ {
+			out.SetNRGBA(x, y, color.NRGBAModel.Convert(img.At(x, y)).(color.NRGBA))
+		}
+	}
+	fmt.Printf("源图 %s（SVG）：光栅化为 %dx%d\n", path, size, size)
 	return out, nil
 }
 
